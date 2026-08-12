@@ -92,6 +92,14 @@ if (@($remainingVms).Count -gt 0) {
     return
 }
 
+$remainingValidationVms = foreach ($vm in $script:ValidationVmDefinitions) {
+    @(Get-LabVmProcess -Name $vm.Name)
+}
+if (@($remainingValidationVms).Count -gt 0) {
+    Write-Warning '兼容性验证虚拟机仍在运行，保留集群二层交换机。'
+    return
+}
+
 $switchProcesses = @(Get-LabVmProcess -Name $script:ClusterSwitchName)
 if ($switchProcesses.Count -eq 0) {
     Write-Host "[$($script:ClusterSwitchName)] 未运行。"

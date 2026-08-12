@@ -18,7 +18,10 @@ __pycache__/
 *.pyc
 
 # 虚拟机镜像、固件与离线安装包
-packages/
+# packages/ 下的二进制载荷属于本地离线交付物，不进入公开 Git；校验清单和构建脚本可提交。
+packages/sources/
+packages/payload/
+packages/dist/
 *.qcow
 *.qcow2
 *.img
@@ -43,6 +46,7 @@ packages/
 *.7z
 
 # 本地编译产物与可执行二进制
+/gen_license-arm64
 *.o
 *.obj
 *.a

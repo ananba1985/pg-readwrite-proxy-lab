@@ -1,6 +1,6 @@
 # 每行格式：数据库用户名:明文密码
 # 复制为 config/pool-users.txt，只填写会通过 Pgpool-II 登录的现有业务账号。
 # 文件必须 chmod 600；脚本会把它转换成 AES 加密的 /etc/pgpool-II/pool_passwd。
-# MONITOR_USER 与 LAB_USER 由 secrets.env 自动加入，不要在此重复。
+# MONITOR_USER 与 BUSINESS_USER 由 secrets.env 自动加入，不要在此重复。
 
 app_user:CHANGE_ME_APP_PASSWORD

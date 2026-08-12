@@ -2,8 +2,7 @@
 wal_level = 'replica'
 max_wal_senders = {{MAX_WAL_SENDERS}}
 max_replication_slots = {{MAX_REPLICATION_SLOTS}}
-wal_keep_size = '{{WAL_KEEP_SIZE}}'
-max_slot_wal_keep_size = '{{MAX_SLOT_WAL_KEEP_SIZE}}'
+wal_keep_segments = {{WAL_KEEP_SEGMENTS}}
 wal_sender_timeout = '60s'
 hot_standby = on
 listen_addresses = '{{PRIMARY_LISTEN_ADDRESSES}}'

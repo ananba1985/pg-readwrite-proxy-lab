@@ -5,79 +5,85 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
 
-usage() {
-  cat <<'EOF'
-用法：sudo ./scripts/00-preflight.sh primary|standby|pgpool
-
-本脚本只读，不安装软件、不改配置、不启停服务。
-EOF
-}
-
 ROLE="${1:-}"
-[[ "${ROLE}" =~ ^(primary|standby|pgpool)$ ]] || {
-  usage
-  exit 2
-}
+[[ "${ROLE}" =~ ^(primary|standby|pgpool)$ ]] || { printf '用法：sudo %s primary|standby|pgpool\n' "$0" >&2; exit 2; }
 
 require_root
 load_cluster_config
 detect_el_major
-require_command systemctl
 require_command timeout
+log "只读预检：角色=${ROLE}，系统=${PRETTY_NAME:-unknown}，架构=$(uname -m)，SELinux=$(getenforce 2>/dev/null || printf unknown)"
 
-log "角色=${ROLE}，系统=${PRETTY_NAME:-unknown}，架构=$(uname -m)"
-log "内核=$(uname -r)，SELinux=$(getenforce 2>/dev/null || printf 'unknown')"
-log "主机名=$(hostname -f 2>/dev/null || hostname)"
-
-if [[ "${ID:-}" == 'centos' && "${EL_MAJOR}" == '8' ]] && ! grep -qi stream /etc/centos-release 2>/dev/null; then
-  die 'CentOS Linux 8 已停止维护；请升级到受支持的 Stream/RHEL 兼容版本。'
-fi
+assert_local_ipv4() {
+  local expected="$1" label="$2"
+  /sbin/ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${expected}" || \
+    die "${label} 配置地址 ${expected} 不属于当前服务器。"
+}
 
 case "${ROLE}" in
   primary)
-    [[ -x "${PRIMARY_PG_BIN_DIR}/psql" ]] || die "找不到 ${PRIMARY_PG_BIN_DIR}/psql"
-    [[ -d "${PRIMARY_PGDATA}" ]] || die "主库 PGDATA 不存在: ${PRIMARY_PGDATA}"
-    systemctl is-active --quiet "${PRIMARY_SERVICE}" || die "主库服务未运行: ${PRIMARY_SERVICE}"
-    version_num="$(run_as_pg "${PRIMARY_PG_BIN_DIR}" "${PRIMARY_PG_BIN_DIR}/psql" -XAtq -p "${PRIMARY_PORT}" -d postgres -c 'show server_version_num')"
-    actual_major="$((version_num / 10000))"
-    [[ "${actual_major}" == "${PG_MAJOR}" ]] || die "主库大版本=${actual_major}，配置 PG_MAJOR=${PG_MAJOR}。"
-    recovery="$(run_as_pg "${PRIMARY_PG_BIN_DIR}" "${PRIMARY_PG_BIN_DIR}/psql" -XAtq -p "${PRIMARY_PORT}" -d postgres -c 'select pg_is_in_recovery()')"
-    [[ "${recovery}" == 'f' ]] || die '指定的主库实际处于恢复态，拒绝继续。'
-    run_as_pg "${PRIMARY_PG_BIN_DIR}" "${PRIMARY_PG_BIN_DIR}/psql" -X -p "${PRIMARY_PORT}" -d postgres -c \
-      "select current_setting('server_version') as version, current_setting('data_directory') as data_directory, current_setting('wal_level') as wal_level, current_setting('max_wal_senders') as max_wal_senders, current_setting('max_replication_slots') as max_replication_slots;"
-    log "PGDATA 磁盘：$(df -hP "${PRIMARY_PGDATA}" | tail -n 1)"
+    assert_local_ipv4 "${PRIMARY_HOST}" PRIMARY_HOST
+    assert_safe_pgdata "${PRIMARY_PGDATA}"
+    verify_nebula_runtime "${PRIMARY_PG_BIN_DIR}" "${PRIMARY_ADMIN_TOOL}" Primary
+    [[ -d "${PRIMARY_PGDATA}" ]] || die "Primary PGDATA 不存在: ${PRIMARY_PGDATA}"
+    pg_ctl_is_running "${PRIMARY_PG_BIN_DIR}" "${PRIMARY_PGDATA}" || die 'Primary 未由 pg_ctl 运行。'
+    row="$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres \
+      "select current_setting('server_version_num'),pg_is_in_recovery(),current_setting('data_directory'),current_setting('wal_level'),current_setting('max_wal_senders'),current_setting('max_replication_slots')")"
+    [[ "${row}" == "120000|f|${PRIMARY_PGDATA}|"* ]] || die "Primary 身份或路径异常: ${row}"
+    business_count="$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres \
+      "select count(*) from pg_database where datname='${BUSINESS_DATABASE}'")"
+    [[ "${business_count}" == '1' ]] || die "Primary 缺少现有业务库 ${BUSINESS_DATABASE}。"
+    role_count="$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres \
+      "select count(*) from pg_roles where rolname='${BUSINESS_USER}' and rolcanlogin")"
+    [[ "${role_count}" == '1' ]] || die "Primary 缺少现有业务账号 ${BUSINESS_USER}。"
+    log "Primary 状态=${row}"
+    log "Primary PGDATA 磁盘=$(df -hP "${PRIMARY_PGDATA}" | tail -n 1)"
     ;;
   standby)
-    log "目标 PGDATA 磁盘：$(df -hP "$(dirname "${STANDBY_PGDATA}")" 2>/dev/null | tail -n 1 || printf '目录尚不存在')"
-    if tcp_check "${PRIMARY_HOST}" "${PRIMARY_PORT}"; then
-      log "可访问 Primary ${PRIMARY_HOST}:${PRIMARY_PORT}。"
+    assert_local_ipv4 "${STANDBY_HOST}" STANDBY_HOST
+    assert_safe_pgdata "${STANDBY_PGDATA}"
+    verify_nebula_runtime "${STANDBY_PG_BIN_DIR}" "${STANDBY_ADMIN_TOOL}" 'Standby 目标机'
+    [[ -d "${STANDBY_PGDATA}" ]] || die "Standby PGDATA 不存在: ${STANDBY_PGDATA}"
+    if pg_ctl_is_running "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}"; then
+      row="$(nebula_admin_query "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" postgres \
+        "select current_setting('server_version_num'),pg_is_in_recovery(),current_setting('data_directory')")"
+      [[ "${row}" == "120000|"*"|${STANDBY_PGDATA}" ]] || die "Standby 目标机版本或路径异常: ${row}"
+      if [[ "${row}" == '120000|f|'* ]]; then
+        warn 'Standby 目标机当前仍是独立可写实例；只有显式维护窗口授权后才会移动旧 PGDATA。'
+      else
+        log 'Standby 已处于恢复态；后续脚本将按原地校验/刷新凭据处理。'
+      fi
+    elif validate_standby_resume_state; then
+      log "Standby 处于可恢复中间态：服务停止，备份状态=${STANDBY_RESUME_STATE_FILE}；允许继续基础备份。"
     else
-      warn "当前无法访问 Primary ${PRIMARY_HOST}:${PRIMARY_PORT}；可能尚未放行或尚未应用 Primary 配置。"
+      die 'Standby 服务未运行且没有有效的中断恢复状态，拒绝猜测。'
     fi
-    [[ ! -e "${STANDBY_PGDATA}/PG_VERSION" ]] || warn "${STANDBY_PGDATA} 已包含数据库集群；初始化脚本默认会拒绝覆盖。"
+    log "Standby 目标磁盘=$(df -hP "${STANDBY_PGDATA}" | tail -n 1)"
+    tcp_check "${PRIMARY_HOST}" "${PRIMARY_PORT}" || die "Standby 无法访问 Primary ${PRIMARY_HOST}:${PRIMARY_PORT}。"
     ;;
   pgpool)
-    for endpoint in "${PRIMARY_HOST}:${PRIMARY_PORT}" "${STANDBY_HOST}:${STANDBY_PORT}"; do
-      host="${endpoint%:*}"
-      port="${endpoint##*:}"
-      if tcp_check "${host}" "${port}"; then
-        log "可访问后端 ${endpoint}。"
-      else
-        warn "当前无法访问后端 ${endpoint}。"
-      fi
-    done
+    assert_local_ipv4 "${PGPOOL_HOST}" PGPOOL_HOST
+    [[ ! -x /opt/pgsql12/bin/postgres ]] || die 'Pgpool-II 节点存在数据库服务端运行时 /opt/pgsql12/bin/postgres；请先清理错误基线。'
+    validate_offline_payloads
+    tcp_check "${PRIMARY_HOST}" "${PRIMARY_PORT}" || die "Pgpool 节点无法访问 Primary ${PRIMARY_HOST}:${PRIMARY_PORT}。"
+    if tcp_check "${STANDBY_HOST}" "${STANDBY_PORT}"; then
+      log "Pgpool 节点可访问 Standby 目标 ${STANDBY_HOST}:${STANDBY_PORT}。"
+    elif [[ "${ALLOW_STANDBY_REINITIALIZE}" == 'yes' ]]; then
+      warn "Standby 目标暂未监听 ${STANDBY_HOST}:${STANDBY_PORT}；已获重建授权，允许继续。Pgpool 配置前仍会强制验证角色和连通性。"
+    else
+      die "Pgpool 节点无法访问 Standby ${STANDBY_HOST}:${STANDBY_PORT}。"
+    fi
     if ss -ltn "sport = :${PGPOOL_PORT}" 2>/dev/null | grep -q LISTEN; then
-      warn "TCP/${PGPOOL_PORT} 已被占用。"
+      warn "TCP/${PGPOOL_PORT} 已监听；配置阶段将重启既有 Pgpool 服务。"
     else
       log "TCP/${PGPOOL_PORT} 当前可用。"
     fi
     ;;
 esac
 
-if systemctl is-active --quiet firewalld; then
+if systemctl is-active --quiet firewalld 2>/dev/null; then
   log 'firewalld=active'
 else
-  warn 'firewalld 未运行；需确认上游安全组/防火墙策略。'
+  warn 'firewalld 未运行；MANAGE_FIREWALL=no 时必须由上游网络策略放行精确端口。'
 fi
-
-log '预检完成（只读，未修改系统）。'
+log '只读预检通过。'

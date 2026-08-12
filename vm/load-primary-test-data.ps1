@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'vm-common.ps1')
 
 if (-not $ConfirmReset) {
-    throw '该操作会删除并重建 Primary 上的 rw_proxy_lab；确认后请传入 -ConfirmReset。'
+    throw '该操作会保留 PG_Safe_tool 创建的 rw_lab_test/rw_proxy_lab，并原子重建 business schema；确认后请传入 -ConfirmReset。'
 }
 
 $loaderScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\scripts\50-reset-primary-test-data.sh'))
@@ -84,4 +84,4 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Primary 测试数据生成失败。'
 }
 
-Write-Host 'Primary 测试数据库 rw_proxy_lab 已完成确定性数据生成。'
+Write-Host 'Primary 测试数据库 rw_proxy_lab 已保留维护工具用户和数据库，并完成确定性 business schema 重建。'

@@ -33,13 +33,14 @@ backend_clustering_mode = 'streaming_replication'
 backend_hostname0 = '{{PRIMARY_HOST}}'
 backend_port0 = {{PRIMARY_PORT}}
 backend_weight0 = {{PRIMARY_READ_WEIGHT}}
-backend_flag0 = 'ALLOW_TO_FAILOVER'
+backend_flag0 = 'DISALLOW_TO_FAILOVER'
 backend_application_name0 = ''
 
 # backend 1：Standby，承担普通 SELECT。
 backend_hostname1 = '{{STANDBY_HOST}}'
 backend_port1 = {{STANDBY_PORT}}
 backend_weight1 = {{STANDBY_READ_WEIGHT}}
+# Standby 故障时允许健康检查将其摘除，但没有提升命令，绝不会自动提升。
 backend_flag1 = 'ALLOW_TO_FAILOVER'
 backend_application_name1 = '{{STANDBY_APPLICATION_NAME}}'
 
@@ -48,7 +49,7 @@ load_balance_mode = on
 statement_level_load_balance = on
 disable_load_balance_on_write = '{{DISABLE_LOAD_BALANCE_ON_WRITE}}'
 allow_sql_comments = off
-read_only_function_list = ''
+read_only_function_list = 'current_setting,current_database,inet_server_addr,pg_is_in_recovery'
 write_function_list = ''
 delay_threshold_by_time = {{READ_LAG_THRESHOLD_SECONDS}}
 prefer_lower_delay_standby = on

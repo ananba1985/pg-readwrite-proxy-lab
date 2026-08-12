@@ -45,6 +45,30 @@ BEGIN
   IF EXISTS (
     SELECT 1
     FROM business.orders AS o
+    LEFT JOIN business.customers AS c ON c.customer_id = o.customer_id
+    WHERE c.customer_id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'order with missing customer found';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM business.order_items AS i
+    LEFT JOIN business.orders AS o ON o.order_id = i.order_id
+    WHERE o.order_id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'order item with missing order found';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM business.order_items AS i
+    LEFT JOIN business.products AS p ON p.product_id = i.product_id
+    WHERE p.product_id IS NULL
+  ) THEN
+    RAISE EXCEPTION 'order item with missing product found';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM business.orders AS o
     JOIN (
       SELECT order_id, sum(line_amount)::numeric(16,2) AS item_total
       FROM business.order_items
@@ -53,6 +77,17 @@ BEGIN
     WHERE o.total_amount <> totals.item_total
   ) THEN
     RAISE EXCEPTION 'order total does not match item total';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM pg_constraint AS c
+    JOIN pg_class AS t ON t.oid = c.conrelid
+    JOIN pg_namespace AS n ON n.oid = t.relnamespace
+    WHERE n.nspname = 'business'
+      AND c.contype IN ('c', 'f', 'p', 'u')
+      AND NOT c.convalidated
+  ) THEN
+    RAISE EXCEPTION 'unvalidated business constraint found';
   END IF;
   IF EXISTS (
     SELECT 1

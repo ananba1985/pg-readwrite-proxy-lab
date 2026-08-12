@@ -60,27 +60,49 @@ ssh root@192.168.80.130
 
 如需强制停止，必须显式执行 `.\vm\stop-all.ps1 -Force`。正常情况应先使用不带 `-Force` 的脚本，让来宾系统完成关机。
 
-## PostgreSQL 12 独立安装基线重置
+## NebulaCM PostgreSQL 12.0 基线
 
-Primary 和第二台数据库服务器的“默认安装完成”状态是两套互相独立的 PostgreSQL 12.22：两者分别执行 `initdb`，没有复制账号、复制槽、WAL receiver、`primary_conninfo` 或 recovery signal。Streaming Replication 必须由项目部署脚本另行配置。
+Primary 和 Standby 目标机都通过下列厂商介质自带的 `install.sh` 和各自主机授权码完成安装：
 
-从项目根目录同时重置两台数据库服务器：
-
-```powershell
-.\vm\reset-both-independent-pg12.ps1 -ConfirmReset
+```text
+NebulaCM_Dbn_PostgreSQL-install-runtime-12.0-ky10-aarch64-20241212.tar.gz
 ```
 
-该命令是破坏性操作，会停止两台 PostgreSQL 服务并且只删除以下两个精确目标，然后使用已校验的 ARM64 安装归档重新安装、初始化和启动：
+两台当前仍是互相独立的 NebulaCM PostgreSQL 12.0 实例：`pg_is_in_recovery()` 均为 `false`，system identifier 不同，没有 WAL receiver 或 recovery signal。Streaming Replication 必须由项目部署脚本从现有 Primary 初始化，不能把当前 Standby 目标机误写成已经完成的 Standby。
 
-- `/opt/pgsql12`
-- `/pgsql/12/data`
+两台固定路径相同：
 
-脚本不会删除 Nebula 安装包、授权二维码、源码构建目录或其他 `/pgsql/12` 子目录。删除 PGDATA 前会把配置文件和 `pg_controldata` 结果保存到 `/var/backups/pg-readwrite-proxy-lab/independent-reset-*`，但不会备份业务数据。
+```text
+/opt/pgsql12
+/opt/pgsql12/bin
+/pgsql/12/data
+/pgsql/12/data/postgresql.conf
+/pgsql/12/data/pg_hba.conf
+```
 
-包装器会把单机重置命令安装到两台服务器。只重置当前服务器时可在该服务器显式执行：
+厂商安装器没有创建 PostgreSQL systemd unit；当前使用 `/opt/pgsql12/bin/pg_ctl` 管理进程，并由 `/etc/rc.d/rc.local` 启动。状态检查示例：
 
 ```bash
-sudo /usr/local/sbin/reset-independent-pg12 --confirm-reset
+sudo runuser -u postgres -- \
+  /opt/pgsql12/bin/pg_ctl -D /pgsql/12/data status
 ```
 
-单机脚本只接受 `192.168.80.110` 或 `192.168.80.120`，并在任何删除之前校验 CPU 架构、`/pgsql` 挂载、固定目标路径、5432 监听状态和 PostgreSQL 归档 SHA256。省略 `--confirm-reset` 时拒绝执行。
+数据库重装只能使用上述厂商介质、每台机器自己的授权信息和配套 `PG_Safe_tool`。任何不调用厂商安装、授权及维护流程的数据库重建入口都不属于当前环境，不得用于这两台虚拟机。
+
+## PG_Safe_tool 与测试数据
+
+两台均已部署 `PG_Safe_tool 1.0.8`，路径为：
+
+```text
+/var/tmp/pg-safe-tool-stage-1.0.8/PG_Safe_tool
+```
+
+Primary 已通过该工具创建 `rw_lab_test`、`rw_proxy_lab` 和三条固定 IP HBA 规则；Standby 目标机只部署工具并执行只读检查。不要在 Standby 上手工重复创建业务用户和数据库，物理基础备份会从 Primary 带入这些对象。
+
+Primary 测试数据可在项目根目录重新生成：
+
+```powershell
+.\vm\load-primary-test-data.ps1 -ConfirmReset
+```
+
+该命令只原子重建 `rw_proxy_lab` 中的 `business` schema，不负责重装数据库。完整的真实环境、凭据文件位置、维护工具约束和数据库验收结果见被 Git 忽略的 [`runtime/DEVELOPMENT_TEST_ENVIRONMENT.md`](runtime/DEVELOPMENT_TEST_ENVIRONMENT.md)。

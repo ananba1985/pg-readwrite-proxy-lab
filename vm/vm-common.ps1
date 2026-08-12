@@ -53,6 +53,25 @@ $script:VmDefinitions = @(
     }
 )
 
+# Compatibility validation nodes share the layer-2 lab network but are not
+# database-role members and are therefore not started by start-all.ps1.
+$script:ValidationVmDefinitions = @(
+    [pscustomobject]@{
+        Name = 'kylin-v10-compat'
+        Role = 'Compatibility validation'
+        Disk = Join-Path $PSScriptRoot 'disks\kylin-v10-compat.qcow2'
+        SshPort = 22021
+        QmpPort = 23021
+        QgaPort = 23022
+        VncPort = 5904
+        VncDisplay = 4
+        ClusterSwitchPort = 15914
+        ClusterAddress = '192.168.80.140'
+        ManagementMac = '52:54:00:80:21:21'
+        ClusterMac = '52:54:00:12:34:40'
+    }
+)
+
 function Assert-LabVmPrerequisites {
     foreach ($requiredPath in @($script:QemuExecutable, $script:QemuImgExecutable, $script:FirmwareImage)) {
         if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -191,11 +210,11 @@ function Get-ClusterSwitchQemuArguments {
         '-monitor', 'none'
     )
 
-    foreach ($vm in $script:VmDefinitions) {
-        $linkId = 'link_' + $vm.Name.Replace('-', '_')
-        $hubPortId = 'hub_' + $vm.Name.Replace('-', '_')
+    foreach ($endpoint in @($script:VmDefinitions) + @($script:ValidationVmDefinitions)) {
+        $linkId = 'link_' + $endpoint.Name.Replace('-', '_')
+        $hubPortId = 'hub_' + $endpoint.Name.Replace('-', '_')
         $arguments += @(
-            '-netdev', "socket,id=$linkId,listen=127.0.0.1:$($vm.ClusterSwitchPort)",
+            '-netdev', "socket,id=$linkId,listen=127.0.0.1:$($endpoint.ClusterSwitchPort)",
             '-netdev', "hubport,id=$hubPortId,hubid=0,netdev=$linkId"
         )
     }

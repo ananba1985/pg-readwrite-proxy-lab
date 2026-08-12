@@ -10,7 +10,9 @@ New-Item -ItemType Directory -Path $script:RuntimeDirectory -Force | Out-Null
 
 $switchProcesses = @(Get-LabVmProcess -Name $script:ClusterSwitchName)
 if ($switchProcesses.Count -eq 0) {
-    foreach ($port in @($script:ClusterSwitchQmpPort) + @($script:VmDefinitions.ClusterSwitchPort)) {
+    $switchPorts = @($script:VmDefinitions.ClusterSwitchPort) +
+        @($script:ValidationVmDefinitions.ClusterSwitchPort)
+    foreach ($port in @($script:ClusterSwitchQmpPort) + $switchPorts) {
         $listeners = @(Get-LocalTcpListener -Port $port)
         if ($listeners.Count -gt 0) {
             throw "集群二层交换机所需本机 TCP 端口 $port 已被占用，拒绝启动。"
