@@ -1,3 +1,4 @@
-8bcd29149d64d560bf86a1047dd029587a6f14bd55283cc606f5678d06cf6e23  payload/pgpool-II-4.7.2-pg12.0-aarch64-centos7.tar.gz
-d6247f81998669fd66115aaa317a4d327969ed4e47bcb29199b62a05a22c10c4  payload/postgresql-client-12.0-aarch64-centos7.tar.gz
-a49f0d4998710638450ee5c4d5e1e4345ca4c09d4484a6f6dceb42bd7a52af72  payload/sshpass-1.10-aarch64-centos7.tar.gz
+b80c79b8e6537a14a6adc8ab4ae58baa40a2e027c8fc99a3589510462425dbea  payload/pgpool-II-4.7.2-pg12.0-aarch64-kylin-v10.tar.gz
+1314901d8b0de906fcc47c7784913fd347d07a3b563475f8eae4e16310ba8667  payload/postgresql-client-12.0-aarch64-kylin-v10.tar.gz
+6d00411d0098b2bab0c3f9e3a0d5d009907189eb2b0e3a743edd3063bce9a257  payload/pgpool-runtime-kylin-v10-aarch64.tar.gz
+84bcff17fc7e48d0a8552c985818e17e485f95a66b3c50c4eedde6bcbdc96ffd  payload/sshpass-1.10-aarch64-kylin-v10.tar.gz

@@ -63,14 +63,15 @@ load_cluster_config() {
   local required=(
     PG_MAJOR PG_VERSION_FULL DB_DISTRIBUTION DBN_VERSION_MARKER
     DB_POSTGRES_SHA256 DB_PG_BASEBACKUP_SHA256 DB_PG_CONFIG_SHA256 DB_TOOLS_SHA256 PG_OS_USER
-    PGPOOL_MAJOR PGPOOL_VERSION PGPOOL_INSTALL_PREFIX PG_CLIENT_PREFIX OFFLINE_PACKAGE_DIR
+    PGPOOL_MAJOR PGPOOL_VERSION PGPOOL_INSTALL_PREFIX PG_CLIENT_PREFIX PGPOOL_RUNTIME_PREFIX OFFLINE_PACKAGE_DIR
     PGPOOL_PAYLOAD_FILE PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_FILE PG_CLIENT_PAYLOAD_SHA256
+    PGPOOL_RUNTIME_PAYLOAD_FILE PGPOOL_RUNTIME_PAYLOAD_SHA256
     SSHPASS_PAYLOAD_FILE SSHPASS_PAYLOAD_SHA256
     PRIMARY_HOST PRIMARY_PORT PRIMARY_PGDATA PRIMARY_PG_BIN_DIR PRIMARY_ADMIN_TOOL PRIMARY_LISTEN_ADDRESSES
     STANDBY_HOST STANDBY_PORT STANDBY_PGDATA STANDBY_PG_BIN_DIR STANDBY_ADMIN_TOOL STANDBY_LISTEN_ADDRESSES
     STANDBY_APPLICATION_NAME REPLICATION_SLOT_NAME
     PGPOOL_HOST PGPOOL_PORT PCP_PORT PGPOOL_SERVICE PGPOOL_CONFIG_DIR
-    STANDBY_ADDRESS_CIDR PGPOOL_ADDRESS_CIDR ALLOWED_CLIENT_CIDRS MANAGE_FIREWALL
+    STANDBY_ADDRESS_CIDR PGPOOL_ADDRESS_CIDR ALLOWED_CLIENT_CIDRS MANAGE_DB_FIREWALL MANAGE_PGPOOL_FIREWALL
     REPLICATION_USER MONITOR_USER BUSINESS_USER BUSINESS_DATABASE PCP_USER
     MAX_WAL_SENDERS MAX_REPLICATION_SLOTS WAL_KEEP_SEGMENTS
     PRIMARY_READ_WEIGHT STANDBY_READ_WEIGHT DISABLE_LOAD_BALANCE_ON_WRITE READ_LAG_THRESHOLD_SECONDS
@@ -87,10 +88,20 @@ load_cluster_config() {
   [[ "${PG_MAJOR}" == '12' && "${PG_VERSION_FULL}" == '12.0' && "${DB_DISTRIBUTION}" == 'NebulaCM' ]] || \
     die '当前安装器只验收既有 NebulaCM PostgreSQL 12.0。'
   [[ "${PGPOOL_MAJOR}" == '4.7' && "${PGPOOL_VERSION}" == '4.7.2' ]] || die '当前安装器固定为 Pgpool-II 4.7.2。'
+  [[ "${PGPOOL_INSTALL_PREFIX}" == '/opt/pgpool-II-4.7.2' && "${PG_CLIENT_PREFIX}" == '/opt/pgpool-client-12.0' && \
+     "${PGPOOL_RUNTIME_PREFIX}" == '/opt/pgpool-runtime-kylin-v10' ]] || die 'Pgpool 离线运行时前缀不是已验收值。'
   [[ "${DISABLE_LOAD_BALANCE_ON_WRITE}" =~ ^(off|transaction|trans_transaction|always|dml_adaptive)$ ]] || die 'DISABLE_LOAD_BALANCE_ON_WRITE 无效。'
-  [[ "${MANAGE_FIREWALL}" =~ ^(yes|no)$ ]] || die 'MANAGE_FIREWALL 只能是 yes 或 no。'
+  [[ "${MANAGE_DB_FIREWALL}" =~ ^(yes|no)$ ]] || die 'MANAGE_DB_FIREWALL 只能是 yes 或 no。'
+  [[ "${MANAGE_PGPOOL_FIREWALL}" =~ ^(yes|no)$ ]] || die 'MANAGE_PGPOOL_FIREWALL 只能是 yes 或 no。'
   [[ "${APPLY_PRIMARY_RESTART}" =~ ^(yes|no)$ ]] || die 'APPLY_PRIMARY_RESTART 只能是 yes 或 no。'
   [[ "${ALLOW_STANDBY_REINITIALIZE}" =~ ^(yes|no)$ ]] || die 'ALLOW_STANDBY_REINITIALIZE 只能是 yes 或 no。'
+  for name in PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_SHA256 PGPOOL_RUNTIME_PAYLOAD_SHA256 SSHPASS_PAYLOAD_SHA256; do
+    [[ "${!name}" =~ ^[0-9a-f]{64}$ ]] || die "${name} 必须是 64 位小写 SHA256。"
+  done
+  for name in PRIMARY_PORT STANDBY_PORT PGPOOL_PORT PCP_PORT; do
+    [[ "${!name}" =~ ^[0-9]{1,5}$ ]] && ((10#${!name} >= 1 && 10#${!name} <= 65535)) || die "${name} 不是有效端口。"
+  done
+  [[ "${PRIMARY_PORT}" == "${STANDBY_PORT}" ]] || die '当前安装器要求 Primary 与 Standby 端口一致。'
 
   validate_ipv4 "${PRIMARY_HOST}" PRIMARY_HOST
   validate_ipv4 "${STANDBY_HOST}" STANDBY_HOST
@@ -143,10 +154,11 @@ verify_sha256() {
 validate_offline_payloads() {
   verify_sha256 "$(offline_file "${PGPOOL_PAYLOAD_FILE}")" "${PGPOOL_PAYLOAD_SHA256}" 'Pgpool-II 载荷'
   verify_sha256 "$(offline_file "${PG_CLIENT_PAYLOAD_FILE}")" "${PG_CLIENT_PAYLOAD_SHA256}" 'PostgreSQL 客户端载荷'
+  verify_sha256 "$(offline_file "${PGPOOL_RUNTIME_PAYLOAD_FILE}")" "${PGPOOL_RUNTIME_PAYLOAD_SHA256}" '麒麟私有运行库载荷'
   verify_sha256 "$(offline_file "${SSHPASS_PAYLOAD_FILE}")" "${SSHPASS_PAYLOAD_SHA256}" 'sshpass 载荷'
 }
 
-detect_el_major() {
+detect_db_platform() {
   [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
   # shellcheck disable=SC1091
   source /etc/os-release
@@ -157,6 +169,18 @@ detect_el_major() {
   [[ "${EL_MAJOR}" == '7' && "${CPU_ARCH}" == 'aarch64' ]] || die "当前离线载荷只验收 CentOS/RHEL 7 aarch64；检测到 ${PRETTY_NAME:-unknown} ${CPU_ARCH}。"
   warn 'CentOS 7 与 PostgreSQL 12 均已停止主流维护；正式投产前必须完成安全与升级评审。'
   export EL_MAJOR CPU_ARCH
+}
+
+detect_pgpool_platform() {
+  [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  CPU_ARCH="$(uname -m)"
+  [[ "${ID:-}" == 'kylin' && "${VERSION_ID:-}" == 'V10' && "${CPU_ARCH}" == 'aarch64' ]] || \
+    die "当前 Pgpool 离线载荷只验收 Kylin Linux Advanced Server V10 aarch64；检测到 ${PRETTY_NAME:-unknown} ${CPU_ARCH}。"
+  [[ "$(getconf GNU_LIBC_VERSION 2>/dev/null || true)" == 'glibc 2.28' ]] || \
+    die "麒麟 glibc 基线不匹配：$(getconf GNU_LIBC_VERSION 2>/dev/null || printf unknown)。"
+  export CPU_ARCH
 }
 
 verify_nebula_runtime() {
@@ -285,9 +309,9 @@ sql_literal() {
 }
 
 add_firewall_rule() {
-  local cidr="$1" port="$2" rule
-  [[ "${MANAGE_FIREWALL}" == 'yes' ]] || { warn "MANAGE_FIREWALL=no：未添加 ${cidr} -> TCP/${port}；请确认上游防火墙。"; return 0; }
-  systemctl is-active --quiet firewalld || die 'MANAGE_FIREWALL=yes，但 firewalld 未运行。'
+  local enabled="$1" cidr="$2" port="$3" scope="$4" rule
+  [[ "${enabled}" == 'yes' ]] || { warn "${scope} 防火墙托管=no：未添加 ${cidr} -> TCP/${port}；请确认上游防火墙。"; return 0; }
+  systemctl is-active --quiet firewalld || die "${scope} 防火墙托管=yes，但 firewalld 未运行。"
   rule="rule family=\"ipv4\" source address=\"${cidr}\" port port=\"${port}\" protocol=\"tcp\" accept"
   firewall-cmd --permanent --query-rich-rule="${rule}" >/dev/null 2>&1 || firewall-cmd --permanent --add-rich-rule="${rule}" >/dev/null
   firewall-cmd --reload >/dev/null

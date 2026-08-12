@@ -8,7 +8,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 require_root
 load_cluster_config
-detect_el_major
+detect_db_platform
 assert_safe_pgdata "${STANDBY_PGDATA}"
 verify_nebula_runtime "${STANDBY_PG_BIN_DIR}" "${STANDBY_ADMIN_TOOL}" 'Standby 目标机'
 [[ -d "${STANDBY_PGDATA}" ]] || die "Standby PGDATA 不存在: ${STANDBY_PGDATA}"

@@ -35,6 +35,10 @@ custom_tablespaces="$("${primary_psql[@]}" -c "select count(*) from pg_tablespac
 
 existing_recovery='f'
 if pg_ctl_is_running "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}"; then
+  prechange_client_sessions="$(nebula_admin_query "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" postgres \
+    "select count(*) from pg_stat_activity where backend_type='client backend' and pid<>pg_backend_pid()")"
+  [[ "${prechange_client_sessions}" == '0' ]] || \
+    die "Standby 在实际变更前出现 ${prechange_client_sessions} 个客户端连接；尚未停止服务或修改 PGDATA，拒绝继续。"
   existing_recovery="$(nebula_admin_query "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" postgres 'select pg_is_in_recovery()')"
 fi
 if [[ "${existing_recovery}" == 't' ]]; then
@@ -130,7 +134,7 @@ replace_managed_block "${STANDBY_PGDATA}/postgresql.conf" PG_RW_PROXY_INCLUDE "$
 sed -Ei '/^[[:space:]]*host[[:space:]]+replication[[:space:]]+repl[[:space:]]+0\.0\.0\.0\/0[[:space:]]+md5([[:space:]]*(#.*)?)?$/d' "${STANDBY_PGDATA}/pg_hba.conf"
 chown -R "${PG_OS_USER}:${PG_OS_USER}" "${STANDBY_PGDATA}"
 chmod 700 "${STANDBY_PGDATA}"
-add_firewall_rule "${PGPOOL_ADDRESS_CIDR}" "${STANDBY_PORT}"
+add_firewall_rule "${MANAGE_DB_FIREWALL}" "${PGPOOL_ADDRESS_CIDR}" "${STANDBY_PORT}" '数据库节点'
 
 pg_ctl_stop "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}"
 pg_ctl_start "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}" "${STANDBY_PGDATA}/log/pg-rw-proxy-startup.log"

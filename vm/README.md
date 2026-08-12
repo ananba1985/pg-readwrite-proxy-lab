@@ -1,6 +1,8 @@
-# 三台 ARM CentOS 7 虚拟机
+# ARM 三机数据库实验与麒麟 Pgpool 验证机
 
 本目录保存 PostgreSQL Streaming Replication + Pgpool-II 实验用的三机 QEMU 配置。实际磁盘、cloud-init ISO、SSH 私钥和运行日志均为本机产物，已由 `.gitignore` 排除。
+
+当前最终 Pgpool 角色已迁移到单独的麒麟 V10 验证机 `192.168.80.140`（本机 SSH `22021`）。下表中的 `.130` 是上一轮 CentOS Pgpool 基线，保留用于历史回归，正式麒麟一键安装和验收不要以它作为统一入口。
 
 ## 拓扑
 
@@ -122,6 +124,6 @@ Primary 测试数据可在项目根目录重新生成：
 .\vm\reset-pgpool-environment.ps1 -ConfirmReset
 ```
 
-重置会停止并卸载项目创建的 `pgpool.service`，删除 Pgpool-II 4.7.2、PostgreSQL 12.0 客户端、Pgpool 配置/日志/运行目录、`pgpool` 系统账号、历史 Pgpool 配置备份，以及已验证项目暂存目录中的 `cluster.env`、`secrets.env`、`pool-users.txt`。若项目运行配置明确记录了 `MANAGE_FIREWALL=yes`，还会按其中的客户端 CIDR 精确删除 TCP/9999 规则。
+该重置入口仅处理历史 `.130` CentOS Pgpool 基线。当前麒麟 `.140` 的清理与重测必须按精确目标执行，不能误用本脚本。旧基线的运行配置若明确记录了 `MANAGE_FIREWALL=yes`，脚本仍会按其中客户端 CIDR 精确删除 TCP/9999 规则。
 
 脚本保留虚拟机磁盘、网络、SSH/root 登录、操作系统包、构建工具、离线介质和安装器源码，也不会连接或修改 Primary、Standby。重置前后只保留不含口令的元数据审计到 `/var/backups/pg-readwrite-proxy-lab/pgpool-reset-<时间>/`；完成后需要重新运行项目离线安装器才能恢复 Pgpool 服务。

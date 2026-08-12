@@ -1,8 +1,8 @@
-# PostgreSQL 读写分离离线安装器
+# PostgreSQL 读写分离麒麟离线安装器
 
-本项目用于在三台 CentOS 7 aarch64 服务器上部署：现有 NebulaCM PostgreSQL 12.0 Primary、新建物理 Standby、独立 Pgpool-II 4.7.2。它不使用 Docker、不引入业务应用，也不在数据库节点安装或替换 PostgreSQL。
+本项目提供一套三机一键部署工具：两台现有 CentOS 7 aarch64 数据库服务器分别作为 NebulaCM PostgreSQL 12.0 Primary 和物理 Standby，一台 Kylin Linux Advanced Server V10 aarch64 服务器作为 Pgpool-II 4.7.2 统一入口。项目不使用容器、不引入业务应用，也不在数据库节点安装或替换 PostgreSQL。
 
-当前离线载荷只支持并已验收 `CentOS Linux 7.9.2009 AltArch aarch64`。项目附带的麒麟 V10 ARM64 机器仅用于兼容性探测；实测当前载荷缺少该系统所需的 OpenSSL 1.0、readline 6 和 libnsl 兼容库，因此安装器会在平台预检阶段拒绝麒麟，不能把 CentOS 7 验收结果外推为麒麟支持。
+当前离线载荷只面向并校验上述组合。Pgpool、PostgreSQL 客户端和所需非 glibc 运行库均在麒麟 V10 ARM64 上原生构建；安装过程不访问软件仓库，也不依赖目标机预装编译器。
 
 ## 架构与边界
 
@@ -11,7 +11,7 @@
     |
     | PostgreSQL 协议（默认 9999，仅允许配置的客户端 CIDR）
     v
-Pgpool-II
+麒麟 V10 Pgpool-II
     |-- DML / 事务内写后读 ------> Primary
     `-- 普通 SELECT -------------> Standby
                                       ^
@@ -19,60 +19,58 @@ Pgpool-II
                                       `---------- Primary
 ```
 
-- Primary 与 Standby 必须已安装同一受支持发行版：`NebulaCM_Dbn_PostgreSQL-install-runtime-12.0-ky10-aarch64-20241212.tar.gz`。
-- 固定数据库路径为 `/opt/pgsql12/bin`，PGDATA 为 `/pgsql/12/data`，生命周期通过 `pg_ctl` 和既有 `rc.local` 管理；不存在数据库 systemd unit。
-- Pgpool 节点只安装官方 PostgreSQL 12.0 客户端库和 Pgpool-II，不包含 `postgres` 服务端、不创建 PGDATA。
-- 基线没有自动提升命令。Standby 故障可以被健康检查摘除，但不会 promote；Primary 标记为不可自动故障转移。
+- Primary 与 Standby 必须已安装同一已验收发行版：`NebulaCM_Dbn_PostgreSQL-install-runtime-12.0-ky10-aarch64-20241212.tar.gz`。
+- 固定数据库路径为 `/opt/pgsql12/bin`，PGDATA 为 `/pgsql/12/data`，生命周期通过 `pg_ctl` 和既有 `rc.local` 管理。
+- Pgpool 节点只安装 `/opt/pgpool-client-12.0`、`/opt/pgpool-II-4.7.2` 和 `/opt/pgpool-runtime-kylin-v10`，不包含 `postgres` 服务端、不创建 PGDATA。
+- 基线不自动提升 Standby。Standby 故障可被健康检查摘除，但不会执行 promote；Primary 标记为禁止自动故障转移。
 
 ## 一键离线安装
 
-将最终归档复制到 Pgpool-II 服务器，解压并以 root 运行：
+将最终归档复制到麒麟 Pgpool 服务器，校验、解压并以 root 运行：
 
 ```bash
-tar -xzf pg-readwrite-proxy-offline-<版本>-centos7-aarch64.tar.gz
-cd pg-readwrite-proxy-offline-<版本>-centos7-aarch64
+sha256sum -c pg-readwrite-proxy-offline-<版本>-kylin-v10-aarch64.tar.gz.sha256
+tar -xzf pg-readwrite-proxy-offline-<版本>-kylin-v10-aarch64.tar.gz
+cd pg-readwrite-proxy-offline-<版本>-kylin-v10-aarch64
 sudo bash install.sh
 ```
 
-启动阶段会一次性要求输入：
+启动阶段会要求输入：
 
-- Pgpool、Primary、Standby 的内网 IPv4；
-- PostgreSQL 端口、Pgpool 对外端口、两台数据库服务器的 SSH 端口；
+- 当前 Pgpool、现有 Primary、Standby 目标机的内网 IPv4；
+- PostgreSQL、Pgpool 和两台数据库服务器 SSH 端口；
 - 允许访问 Pgpool 的客户端 IPv4 CIDR；
+- 是否由安装器在麒麟 firewalld 中精确放行客户端到 Pgpool 端口；
 - 已存在的业务用户名和数据库名；
-- 两台数据库服务器的公共 root SSH 密码（隐藏输入）；
-- 现有业务用户密码（隐藏输入）；
+- 两台数据库服务器的公共 root SSH 密码，以及现有业务用户密码（均隐藏输入）；
 - 维护窗口确认词 `APPLY`。
 
-脚本随后自动生成复制、监控、PCP 与 AES 密钥，并依次执行：
+脚本会先在 root-only 临时配置中生成复制、监控、PCP 与 AES 密钥，然后依次完成：
 
-1. 三节点只读预检；
-2. 备份 Primary 配置，创建/轮换专用复制和监控角色，删除旧的 `repl 0.0.0.0/0` HBA，使用 `pg_ctl` 重启；
-3. 校验 Standby 现有 NebulaCM 运行时，将非空旧 PGDATA 移到 `/var/backups/pg-readwrite-proxy-lab/`，使用 `pg_basebackup` 初始化；
-4. 在 Pgpool 节点离线安装客户端和 Pgpool-II，配置认证、健康检查和延迟阈值；
-5. 验证角色、`streaming`、节点识别、DML 路由、普通 SELECT 路由、事务写后读、监听范围，以及从 Primary 访问 Pgpool 对外入口。
+1. 三节点基础预检和严格只读就绪检查；检查 SSH/root 权限、平台、命令、路径/挂载、网络路由与端口、离线载荷、数据库版本/角色、业务对象与凭据、活动连接、表空间/复制槽、PGDATA 权限、备份和基础备份容量、firewalld；
+2. 任一检查失败即清理本次临时配置并退出，三台服务器均不执行部署变更；
+3. 全部显示 `READY` 后才打印完整变更摘要并要求输入 `APPLY`；
+4. 确认后才备份并配置 Primary，初始化 Standby，安装/配置麒麟 Pgpool；
+5. 最终验证角色、`streaming`、节点识别、DML/SELECT 路由、事务写后读、监听范围，以及从 Primary 访问统一入口。
 
-脚本不创建、不改名、不改密现有业务用户/数据库。配置与凭据保存在解压目录的 `config/`，权限为 600；部署后应迁入密钥系统。安装期 `sshpass` 只解压到 `/var/tmp` 私有目录，退出时清理，不写入系统目录。
+检查阶段允许的唯一写入是 `/var/tmp` 下本次会话的 root-only 临时配置/随机凭据、离线载荷试解压目录、SSH `known_hosts` 和两台数据库节点的临时暂存；这些内容不会覆盖解压目录中的既有运行配置，不会改变数据库或系统服务，并会在检查失败或用户取消时清理。门禁没有跳过选项：任意依赖、权限、路径、容量、网络、端口、载荷或数据库状态不满足，就不会出现 `APPLY` 提示。输入 `APPLY` 后，已有 Pgpool 场景还会在停止服务前再次复核前端连接；复核通过后才临时停止入口，并确认两台数据库的普通客户端连接已归零。Primary 与 Standby 各自在实际改动前还会做最后一次本机连接检查，随后安装器才备份旧运行配置并落盘新配置。
+
+幂等更新检测到本项目 Pgpool 正在运行时，会通过 `SHOW POOL_POOLS` 确认除本次只读检查外没有前端连接，并把当前连接池的后端 PID 精确传给 Primary/Standby 核验。这样只豁免本次已证明属于 Pgpool 的空闲后端，来源 IP 相同的直连客户端仍会失败关闭。如果更新在重新配置 Pgpool 前中断，退出清理会尝试恢复既有 Pgpool 服务。
+
+脚本不会创建、改名或改密现有业务用户/数据库。运行参数与凭据保存在解压目录的 `config/`，权限为 600；安装后应迁入受控密钥系统。安装期 `sshpass` 只解压到 `/var/tmp` 私有目录，退出时清理。
 
 ## 安全与回滚
 
-- `config/cluster.env.example` 中两个破坏性门禁默认均为 `no`。只有一键入口收到 `APPLY` 后，运行副本才设为 `yes`。
-- Primary 修改前将配置复制到 `/var/backups/pg-readwrite-proxy-lab/primary-<时间>/`。
-- 对已知的 PG_Safe_tool `hba/pg_hba_tmp.conf`，脚本会先备份再修复为 `postgres:postgres 0600`，并扫描整个 PGDATA；发现其他 postgres 不可读路径会在基础备份前失败关闭。
-- Standby 原 PGDATA 只移动、不删除。若基础备份失败，原目录仍在时间戳备份中；检查原因后再决定恢复或重跑。
-- Pgpool 每次配置前备份既有配置；PCP 只监听 localhost。
-- `MANAGE_FIREWALL=no` 时脚本不猜测现场网络策略；必须由防火墙/安全组放行 Standby→Primary 5432、Pgpool→两后端 5432，以及客户端 CIDR→Pgpool 9999。
+- 示例配置中的 Primary 重启和 Standby 重建门禁默认都是 `no`；一键入口只在用户输入 `APPLY` 后生成授权值。
+- Primary 修改前备份到 `/var/backups/pg-readwrite-proxy-lab/primary-<时间>/`。
+- 厂商工具遗留的 `hba/pg_hba_tmp.conf` 会先备份再修复权限；发现其他 postgres 不可读路径时会在基础备份前失败关闭。
+- Standby 原 PGDATA 只移动、不删除；Pgpool 每次配置前也备份现有配置。
+- 数据库节点防火墙和 Pgpool 防火墙分开管理。默认不修改当前未运行 firewalld 的数据库节点；麒麟节点仅按客户端 CIDR开放 TCP/9999，PCP 9898 只监听 localhost 且不添加外部规则。
 - 不提交 `config/cluster.env`、`config/secrets.env`、`config/pool-users.txt`，也不记录密码、厂商管理员密码或授权信息。
 
-## 离线包校验与构建
+## 离线载荷与构建
 
-最终二进制载荷只有三项：
-
-- Pgpool-II 4.7.2（链接到 `/opt/pgpool-client-12.0/lib`）；
-- 官方 PostgreSQL 12.0 客户端（无服务端）；
-- sshpass 1.10（仅安装期临时使用）。
-
-归档同时携带三份对应源码与 SHA256 清单。校验：
+`packages/MANIFEST.sha256` 固定四项麒麟载荷：Pgpool-II 4.7.2、PostgreSQL 12.0 客户端、麒麟私有运行库闭包和 sshpass 1.10。`packages/SOURCES.sha256` 固定三份对应上游源码。
 
 ```bash
 cd packages
@@ -80,24 +78,31 @@ sha256sum -c MANIFEST.sha256
 sha256sum -c SOURCES.sha256
 ```
 
-在 CentOS 7 aarch64 构建机重建载荷使用 `packages/build-arm64-payloads.sh`；生成交付包使用：
+在联网的麒麟 V10 aarch64 构建机重建载荷：
+
+```bash
+sudo bash packages/build-kylin-v10-payloads.sh
+```
+
+生成最终离线归档：
 
 ```bash
 sudo bash scripts/90-package-offline.sh <版本>
 ```
 
-脚本只按 SHA 清单拷贝载荷，不会把本地旧包、NebulaCM 厂商介质、PG_Safe_tool、授权文件或虚机文件带入交付包。
+打包器只按 SHA 清单复制载荷，不会带入本地旧包、NebulaCM 厂商介质、PG_Safe_tool、授权文件或虚拟机文件。
 
-## 单步运维与验证
+## 运维与验证入口
 
 - `scripts/00-preflight.sh`：按角色只读预检。
+- `scripts/05-readiness-check.sh`：`APPLY` 之前的严格只读就绪门禁。
+- `scripts/06-state-fingerprint.sh`：比较检查前后将受影响持久状态的无敏感信息指纹。
+- `scripts/07-count-business-sessions.sh`：幂等更新停止既有 Pgpool 后确认数据库普通客户端连接归零。
 - `scripts/10-configure-primary.sh`：配置 Primary。
-- `scripts/20-install-postgresql-standby.sh`：仅校验 Standby 已安装的 NebulaCM，名字为兼容既有步骤编号。
+- `scripts/20-install-postgresql-standby.sh`：只校验 Standby 已安装的 NebulaCM。
 - `scripts/21-bootstrap-standby.sh`：初始化物理 Standby。
-- `scripts/30-install-pgpool.sh`、`31-configure-pgpool.sh`：安装和配置 Pgpool。
-- `scripts/40-verify-cluster.sh`：路由与复制验收。
+- `scripts/30-install-pgpool.sh`、`31-configure-pgpool.sh`：安装和配置麒麟 Pgpool。
+- `scripts/40-verify-cluster.sh`：复制与 SQL 路由验收。
 - `scripts/41-observe-cluster.sh`：只读观察复制/Pgpool 状态。
-- `vm/reset-pgpool-environment.ps1`：本机三虚拟机实验环境专用；默认只读预检，显式传入 `-ConfirmReset` 才将 Pgpool 节点恢复到项目安装器运行前状态。
 
-测试数据说明见 [docs/TEST_DATA.md](docs/TEST_DATA.md)，故障与延迟演练见 [docs/failure-and-delay-tests.md](docs/failure-and-delay-tests.md)，生产化清单见 [docs/production-notes.md](docs/production-notes.md)。
-三机真实部署、路由、延迟与故障恢复结果见 [docs/acceptance-report.md](docs/acceptance-report.md)。
+测试数据见 [docs/TEST_DATA.md](docs/TEST_DATA.md)，故障与延迟演练见 [docs/failure-and-delay-tests.md](docs/failure-and-delay-tests.md)，生产化清单见 [docs/production-notes.md](docs/production-notes.md)，实机证据见 [docs/acceptance-report.md](docs/acceptance-report.md)。

@@ -24,6 +24,7 @@
 
    ```bash
    PCPPASSFILE=/root/.pcppass-maintenance \
+     LD_LIBRARY_PATH=/opt/pgpool-runtime-kylin-v10/lib:/opt/pgpool-client-12.0/lib:/opt/pgpool-II-4.7.2/lib \
      /opt/pgpool-II-4.7.2/bin/pcp_attach_node \
        -w -h 127.0.0.1 -p 9898 -U pgpool_admin -n 1
    ```

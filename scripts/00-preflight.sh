@@ -10,8 +10,11 @@ ROLE="${1:-}"
 
 require_root
 load_cluster_config
-detect_el_major
 require_command timeout
+case "${ROLE}" in
+  primary|standby) detect_db_platform ;;
+  pgpool) detect_pgpool_platform ;;
+esac
 log "只读预检：角色=${ROLE}，系统=${PRETTY_NAME:-unknown}，架构=$(uname -m)，SELinux=$(getenforce 2>/dev/null || printf unknown)"
 
 assert_local_ipv4() {
@@ -84,6 +87,6 @@ esac
 if systemctl is-active --quiet firewalld 2>/dev/null; then
   log 'firewalld=active'
 else
-  warn 'firewalld 未运行；MANAGE_FIREWALL=no 时必须由上游网络策略放行精确端口。'
+  warn 'firewalld 未运行；对应角色未托管防火墙时，必须由上游网络策略放行精确端口。'
 fi
 log '只读预检通过。'

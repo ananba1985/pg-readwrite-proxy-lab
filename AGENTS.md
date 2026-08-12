@@ -2,7 +2,7 @@
 
 ## 项目边界
 
-- 本项目只服务于三台 CentOS/RHEL 兼容服务器上的 PostgreSQL Streaming Replication + Pgpool-II 读写分离。
+- 本项目只服务于两台 CentOS/RHEL 7 aarch64 数据库服务器与一台麒麟 V10 aarch64 Pgpool-II 服务器上的 PostgreSQL Streaming Replication + Pgpool-II 读写分离。
 - 服务器角色固定为：现有 Primary、新建 Standby、独立 Pgpool-II。
 - 不引入业务应用，不使用容器编排，不把代理服务器当作数据库服务器。
 - 基线不自动提升 Standby。任何自动故障转移必须先补齐 fencing、仲裁、RPO/RTO 与回切方案。
