@@ -97,6 +97,7 @@ sudo bash scripts/90-package-offline.sh <版本>
 - `scripts/30-install-pgpool.sh`、`31-configure-pgpool.sh`：安装和配置 Pgpool。
 - `scripts/40-verify-cluster.sh`：路由与复制验收。
 - `scripts/41-observe-cluster.sh`：只读观察复制/Pgpool 状态。
+- `vm/reset-pgpool-environment.ps1`：本机三虚拟机实验环境专用；默认只读预检，显式传入 `-ConfirmReset` 才将 Pgpool 节点恢复到项目安装器运行前状态。
 
 测试数据说明见 [docs/TEST_DATA.md](docs/TEST_DATA.md)，故障与延迟演练见 [docs/failure-and-delay-tests.md](docs/failure-and-delay-tests.md)，生产化清单见 [docs/production-notes.md](docs/production-notes.md)。
 三机真实部署、路由、延迟与故障恢复结果见 [docs/acceptance-report.md](docs/acceptance-report.md)。

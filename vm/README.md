@@ -106,3 +106,22 @@ Primary 测试数据可在项目根目录重新生成：
 ```
 
 该命令只原子重建 `rw_proxy_lab` 中的 `business` schema，不负责重装数据库。完整的真实环境、凭据文件位置、维护工具约束和数据库验收结果见被 Git 忽略的 [`runtime/DEVELOPMENT_TEST_ENVIRONMENT.md`](runtime/DEVELOPMENT_TEST_ENVIRONMENT.md)。
+
+## Pgpool-II 环境重置
+
+后续重复测试项目离线安装器前，可先对独立 Pgpool 节点执行只读预检。无参数与显式 `-PreflightOnly` 完全等价，都不会修改远端环境：
+
+```powershell
+.\vm\reset-pgpool-environment.ps1
+.\vm\reset-pgpool-environment.ps1 -PreflightOnly
+```
+
+确认要恢复到“项目安装器尚未运行”的状态后，必须显式打开破坏性门禁：
+
+```powershell
+.\vm\reset-pgpool-environment.ps1 -ConfirmReset
+```
+
+重置会停止并卸载项目创建的 `pgpool.service`，删除 Pgpool-II 4.7.2、PostgreSQL 12.0 客户端、Pgpool 配置/日志/运行目录、`pgpool` 系统账号、历史 Pgpool 配置备份，以及已验证项目暂存目录中的 `cluster.env`、`secrets.env`、`pool-users.txt`。若项目运行配置明确记录了 `MANAGE_FIREWALL=yes`，还会按其中的客户端 CIDR 精确删除 TCP/9999 规则。
+
+脚本保留虚拟机磁盘、网络、SSH/root 登录、操作系统包、构建工具、离线介质和安装器源码，也不会连接或修改 Primary、Standby。重置前后只保留不含口令的元数据审计到 `/var/backups/pg-readwrite-proxy-lab/pgpool-reset-<时间>/`；完成后需要重新运行项目离线安装器才能恢复 Pgpool 服务。
