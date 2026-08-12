@@ -1,0 +1,66 @@
+# 本地实际参数与凭据
+config/cluster.env
+config/secrets.env
+config/pool-users.txt
+
+# 执行产物
+artifacts/
+*.log
+*.tmp
+
+# 本地 QEMU 虚拟机产物（磁盘、cloud-init、私钥和运行状态）
+vm/disks/
+vm/seeds/
+vm/keys/
+vm/runtime/
+vm/.tools/
+__pycache__/
+*.pyc
+
+# 虚拟机镜像、固件与离线安装包
+packages/
+*.qcow
+*.qcow2
+*.img
+*.raw
+*.iso
+*.ova
+*.ovf
+*.vhd
+*.vhdx
+*.vmdk
+*.fd
+*.rpm
+*.deb
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.zst
+*.zip
+*.7z
+
+# 本地编译产物与可执行二进制
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+*.bin
+
+# 私钥与证书容器
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# 编辑器/系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
