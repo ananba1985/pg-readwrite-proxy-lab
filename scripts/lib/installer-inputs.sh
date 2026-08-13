@@ -3,9 +3,12 @@
 # install.sh 的启动参数与交互补全。调用方需先定义 die()。
 
 show_install_usage() {
-  cat <<'USAGE'
+  local entrypoint_name="${INSTALLER_ENTRYPOINT_NAME:-install.sh}"
+  local final_behavior="${INSTALLER_FINAL_BEHAVIOR:-全部只读检查通过后，数据库连接非零时会显示退出/强制中断菜单，随后仍需输入 APPLY 才开始部署。}"
+  local allowed_client_cidrs_help="${INSTALLER_ALLOWED_CLIENT_CIDRS_HELP:-允许访问 Pgpool 的 IPv4 CIDR，多个值用逗号分隔}"
+  cat <<USAGE
 用法：
-  sudo bash install.sh [参数]
+  sudo bash ${entrypoint_name} [参数]
 
 所有参数同时支持“--参数 值”和“--参数=值”。未提供的参数会在启动阶段交互补全。
 
@@ -16,7 +19,7 @@ show_install_usage() {
   --postgresql-port PORT           Primary/Standby 共用 PostgreSQL 端口，默认 5432
   --pgpool-port PORT               Pgpool-II 对外服务端口，默认 5432
   --ssh-port PORT                  Primary/Standby 共用 root SSH 端口，默认 22
-  --allowed-client-cidrs CIDRS     允许访问 Pgpool 的 IPv4 CIDR，多个值用逗号分隔
+  --allowed-client-cidrs CIDRS     ${allowed_client_cidrs_help}
   --manage-pgpool-firewall VALUE   已废弃兼容参数；接受但忽略，不执行防火墙操作
   --business-user USER             现有业务数据库用户名
   --business-database DATABASE     现有业务数据库名
@@ -24,7 +27,7 @@ show_install_usage() {
   --business-password PASSWORD     现有业务数据库用户密码
   -h, --help                       显示帮助
 
-全部只读检查通过后，数据库连接非零时会显示退出/强制中断菜单，随后仍需输入 APPLY 才开始部署。
+${final_behavior}
 USAGE
 }
 

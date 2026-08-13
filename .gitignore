@@ -68,3 +68,4 @@ id_ed25519*
 .vscode/
 .DS_Store
 Thumbs.db
+*.stackdump

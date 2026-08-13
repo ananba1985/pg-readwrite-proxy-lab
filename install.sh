@@ -11,18 +11,36 @@ STATE_DIR='/var/lib/pg-rw-proxy-installer'
 
 log() { printf '[INSTALL] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
-die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+die() {
+  local source_file="${BASH_SOURCE[1]:-$0}" line_number="${BASH_LINENO[0]:-unknown}"
+  printf '[ERROR] time=%s host=%s source=%s line=%s phase=%s exit=1 pwd=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "${HOSTNAME:-unknown}" "${source_file##*/}" \
+    "${line_number}" "${INSTALL_PHASE:-启动参数与本机环境检查}" "${PWD}" >&2
+  printf '[ERROR] %s\n' "$*" >&2
+  [[ -n "${INSTALL_LOG_FILE:-}" ]] && printf '[ERROR] 完整诊断日志：%s\n' "${INSTALL_LOG_FILE}" >&2
+  exit 1
+}
 INSTALL_PHASE='启动参数与本机环境检查'
 
 report_unexpected_error() {
-  local exit_code="$?" line_number="${BASH_LINENO[0]:-unknown}"
+  local exit_code="$1" line_number="$2" failed_command="$3" stack_index
   ((BASH_SUBSHELL == 0)) || return "${exit_code}"
   trap - ERR
-  printf '[ERROR] 安装器在阶段“%s”异常退出（退出码=%s，install.sh 行=%s）。请保留该行及其前面的错误信息。\n' \
-    "${INSTALL_PHASE}" "${exit_code}" "${line_number}" >&2
+  printf '[ERROR] 安装器异常：time=%s host=%s phase=%s exit=%s source=install.sh line=%s pwd=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "${HOSTNAME:-unknown}" "${INSTALL_PHASE}" "${exit_code}" \
+    "${line_number}" "${PWD}" >&2
+  printf '[ERROR] failed_command=%s\n' "${failed_command}" >&2
+  for ((stack_index=1; stack_index<${#FUNCNAME[@]}; stack_index++)); do
+    printf '[ERROR] stack[%s]=source=%s line=%s function=%s\n' \
+      "${stack_index}" "${BASH_SOURCE[${stack_index}]:-unknown}" \
+      "${BASH_LINENO[$((stack_index-1))]:-unknown}" "${FUNCNAME[${stack_index}]:-main}" >&2
+  done
+  printf '[ERROR] 请保留从当前阶段开始到这里的全部日志。\n' >&2
+  [[ -n "${INSTALL_LOG_FILE:-}" ]] && \
+    printf '[ERROR] 完整诊断日志：%s\n' "${INSTALL_LOG_FILE}" >&2
   return "${exit_code}"
 }
-trap report_unexpected_error ERR
+trap 'report_unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 # shellcheck source=scripts/lib/installer-inputs.sh
 source "${ROOT_DIR}/scripts/lib/installer-inputs.sh"
@@ -30,9 +48,17 @@ initialize_install_inputs
 parse_install_inputs "$@"
 
 [[ "${EUID}" -eq 0 ]] || die '请在 Pgpool-II 服务器上使用 root 运行 bash install.sh。'
-for command_name in ssh tar openssl awk sed sha256sum mktemp getenforce getconf uname id stat df date; do
+for command_name in ssh tar openssl awk sed sha256sum mktemp getenforce getconf uname id stat df date tee; do
   command -v "${command_name}" >/dev/null 2>&1 || die "缺少系统基础命令: ${command_name}"
 done
+INSTALL_LOG_DIR='/var/log/pg-readwrite-proxy-lab'
+mkdir -p "${INSTALL_LOG_DIR}"
+chmod 700 "${INSTALL_LOG_DIR}"
+INSTALL_LOG_FILE="${INSTALL_LOG_DIR}/install-$(date '+%Y%m%d-%H%M%S')-$$.log"
+touch "${INSTALL_LOG_FILE}"
+chmod 600 "${INSTALL_LOG_FILE}"
+exec > >(tee -a "${INSTALL_LOG_FILE}") 2> >(tee -a "${INSTALL_LOG_FILE}" >&2)
+printf '[INSTALL] 完整诊断日志：%s\n' "${INSTALL_LOG_FILE}"
 [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
 # shellcheck disable=SC1091
 source /etc/os-release
@@ -84,7 +110,7 @@ validate_port() {
 }
 
 printf '\nPostgreSQL Streaming Replication + Pgpool-II 离线安装\n'
-printf '目标平台：Primary、Standby 与 Pgpool 节点均为麒麟 V10 aarch64；数据库节点已安装受支持的 NebulaCM PostgreSQL 12.0。\n\n'
+printf '目标平台：Pgpool 节点为麒麟 V10 aarch64；数据库节点为麒麟 V10 生产基线或 CentOS 7 ARM64 实验基线，并已安装固定哈希的 NebulaCM PostgreSQL 12.0。\n\n'
 prompt_default PGPOOL_HOST '当前 Pgpool-II 服务器内网 IPv4 地址' '192.168.80.140'
 prompt_default PRIMARY_HOST '现有 PostgreSQL Primary 内网 IPv4 地址' '192.168.80.110'
 prompt_default STANDBY_HOST 'PostgreSQL Standby 目标机内网 IPv4 地址' '192.168.80.120'
@@ -214,7 +240,18 @@ remote_root() {
   local host="$1"
   "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"${host}" bash -s
 }
-remote_command() { local host="$1" command_text="$2"; printf '%s\n' "${command_text}" | remote_root "${host}"; }
+remote_command() {
+  local host="$1" command_text="$2" remote_status
+  if printf '%s\n' "${command_text}" | remote_root "${host}"; then
+    return 0
+  else
+    remote_status=$?
+    printf '[ERROR] 远端执行失败：host=%s ssh_port=%s phase=%s exit=%s\n' \
+      "${host}" "${SSH_PORT}" "${INSTALL_PHASE}" "${remote_status}" >&2
+    printf '[ERROR] remote_command=%s\n' "${command_text}" >&2
+    return "${remote_status}"
+  fi
+}
 
 stage_id="$(date '+%Y%m%d%H%M%S')-$$"
 primary_stage="/var/tmp/pg-rw-proxy-installer-${stage_id}-primary"
@@ -231,12 +268,14 @@ test "$(id -u)" -eq 0
 test "$(uname -m)" = aarch64
 test -r /etc/os-release
 . /etc/os-release
-test "${ID:-}" = kylin
-test "${VERSION_ID:-}" = V10
+case "${ID:-}:${VERSION_ID:-}" in
+  kylin:V10|centos:7|centos:7.*) ;;
+  *) exit 41 ;;
+esac
 date +%s
 REMOTE_CHECK
 )"; then
-    die "${host}:${SSH_PORT} 的 root SSH、麒麟 V10 ARM64 平台或远端 date 检查失败。"
+    die "${host}:${SSH_PORT} 的 root SSH、受支持数据库节点平台（麒麟 V10 或 CentOS 7 ARM64 实验基线）或远端 date 检查失败。"
   fi
   local_after="$(date +%s)"
   [[ "${remote_epoch}" =~ ^[0-9]+$ ]] || die "${host} 返回的系统时间无效。"
@@ -334,7 +373,7 @@ cat <<SUMMARY
 三节点只读就绪检查全部通过，尚未执行任何部署变更。
 
 检查范围：
-  权限/平台 : 本地 root、远端 root SSH、三节点麒麟 V10 ARM64 基线、Pgpool glibc、SELinux
+  权限/平台 : 本地 root、远端 root SSH、Pgpool 麒麟 V10 ARM64、数据库受支持 ARM64 基线、Pgpool glibc、SELinux
   命令/路径 : 所有部署命令、数据库厂商运行时哈希、PGDATA/配置/HOME/安装前缀、挂载与 inode 属性
   数据库状态 : Primary/Standby 身份、业务对象/密码/探针、活动连接、配置解析、表空间、复制连接/槽
   网络/容量 : 三机路由/ping、必要 TCP、端口归属、配置备份/基础备份/安装空间

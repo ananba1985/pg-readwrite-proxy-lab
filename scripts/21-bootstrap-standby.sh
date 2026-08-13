@@ -100,6 +100,13 @@ if [[ "${existing_recovery}" != 't' ]]; then
     "${slot_args[@]}"
   [[ -f "${STANDBY_PGDATA}/PG_VERSION" && -f "${STANDBY_PGDATA}/postgresql.conf" ]] || die 'pg_basebackup 结果不完整。'
   touch "${STANDBY_PGDATA}/standby.signal"
+  {
+    printf 'basebackup_complete=yes\n'
+    printf 'pgdata=%s\n' "${STANDBY_PGDATA}"
+    printf 'primary_system_id=%s\n' "${primary_system_id}"
+  } >>"${state_file}"
+  chmod 600 "${state_file}"
+  log "基础备份完成标记已写入 ${state_file}；后续启动失败时 repair.sh 将复用当前 PGDATA，不会重新执行 pg_basebackup。"
 else
   log '检测到已初始化的 Standby；不再次移动或覆盖 PGDATA，仅刷新复制凭据和受管配置。'
 fi
@@ -139,7 +146,10 @@ if pg_ctl_is_running "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}"; then
 fi
 pg_ctl_stop "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}"
 pg_ctl_start "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}" "${STANDBY_PGDATA}/log/pg-rw-proxy-startup.log"
-wait_for_postgres "${STANDBY_PG_BIN_DIR}" 127.0.0.1 "${STANDBY_PORT}" 120 || die 'Standby 启动失败。'
+if ! wait_for_postgres "${STANDBY_PG_BIN_DIR}" 127.0.0.1 "${STANDBY_PORT}" 1800; then
+  startup_log="$(tail -n 120 "${STANDBY_PGDATA}/log/pg-rw-proxy-startup.log" 2>/dev/null || true)"
+  die "Standby 在 1800 秒内未就绪；当前 PGDATA 和基础备份完成标记均已保留，禁止重跑 install.sh。请使用 repair.sh 续启。启动日志末尾：${startup_log}"
+fi
 standby="$(nebula_admin_query "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" postgres \
   "select current_setting('cluster_name'),pg_is_in_recovery(),coalesce((select status from pg_stat_wal_receiver limit 1),'')")"
 [[ "${standby}" == 'rw-standby|t|streaming' ]] || die "Standby 未进入 streaming 恢复态: ${standby}"

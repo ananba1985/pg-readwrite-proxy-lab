@@ -4,6 +4,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
+# shellcheck source=lib/primary-client-policy.sh
+source "${SCRIPT_DIR}/lib/primary-client-policy.sh"
 
 require_root
 load_cluster_config
@@ -50,10 +52,31 @@ render_template "${PROJECT_ROOT}/templates/pgpool.conf.tpl" "${temp_conf}" \
   HEALTH_CHECK_RETRY_DELAY "${HEALTH_CHECK_RETRY_DELAY}" CONNECT_TIMEOUT_MS "${CONNECT_TIMEOUT_MS}" \
   LOG_PER_NODE_STATEMENT "${LOG_PER_NODE_STATEMENT}"
 
-IFS=',' read -r -a client_cidrs <<<"${ALLOWED_CLIENT_CIDRS}"
-for cidr in "${client_cidrs[@]}"; do
-  printf 'host    all       all   %-22s md5\n' "$(trim "${cidr}")" >>"${temp_hba_rules}"
-done
+if [[ -n "${PGPOOL_CLIENT_POLICY_FILE:-}" ]]; then
+  [[ "${PGPOOL_CLIENT_POLICY_MODE:-}" == 'primary_hba_repair' ]] || \
+    die '拒绝使用来源未标记为 Primary repair 快照的 Pgpool 客户端策略。'
+  policy_realpath="$(readlink -f -- "${PGPOOL_CLIENT_POLICY_FILE}")"
+  [[ "${policy_realpath}" =~ ^/var/tmp/pg-rw-repair\.[^/]+/primary-client-policy\.rules$ ]] || \
+    die "Pgpool 客户端策略不在本次 repair 私有目录: ${policy_realpath}"
+  validate_pgpool_client_policy_file "${PGPOOL_CLIENT_POLICY_FILE}"
+  policy_sha256="$(sha256sum "${PGPOOL_CLIENT_POLICY_FILE}" | awk '{print $1}')"
+  [[ "${PGPOOL_CLIENT_POLICY_SHA256:-}" =~ ^[0-9a-f]{64}$ && \
+     "${policy_sha256}" == "${PGPOOL_CLIENT_POLICY_SHA256}" ]] || \
+    die 'Pgpool 客户端策略在只读检查后发生变化，拒绝落盘。'
+  policy_rule_count="$(grep -Ec '^[[:space:]]*host[[:space:]]' "${PGPOOL_CLIENT_POLICY_FILE}")"
+  printf '# BEGIN PRIMARY_SYNCED_CLIENT_POLICY\n' >>"${temp_hba_rules}"
+  printf '# policy_sha256=%s rules=%s\n' \
+    "${policy_sha256}" "${policy_rule_count}" >>"${temp_hba_rules}"
+  cat "${PGPOOL_CLIENT_POLICY_FILE}" >>"${temp_hba_rules}"
+  printf '# END PRIMARY_SYNCED_CLIENT_POLICY\n' >>"${temp_hba_rules}"
+  log "Pgpool IPv4 白名单来自 Primary 只读快照：rules=${policy_rule_count} sha256=${policy_sha256}。"
+else
+  IFS=',' read -r -a client_cidrs <<<"${ALLOWED_CLIENT_CIDRS}"
+  for cidr in "${client_cidrs[@]}"; do
+    printf 'host    all       all   %-22s md5\n' "$(trim "${cidr}")" >>"${temp_hba_rules}"
+  done
+  log 'Pgpool 客户端策略使用 install.sh 首次部署参数；后续 repair.sh 将同步 Primary 普通 IPv4 白名单。'
+fi
 awk -v rules="${temp_hba_rules}" '$0=="{{CLIENT_HBA_RULES}}"{while((getline line < rules)>0)print line;close(rules);next}{print}' \
   "${PROJECT_ROOT}/templates/pool_hba.conf.tpl" >"${temp_hba}"
 install -o root -g pgpool -m 640 "${temp_conf}" "${PGPOOL_CONFIG_DIR}/pgpool.conf"

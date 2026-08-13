@@ -52,7 +52,7 @@ down_rows="$(grep -Ec '(^|\|)down(\||$)' <<<"${pool_nodes}" || true)"
 
 log '4/7 使用隔离探针表验证 INSERT 路由到 Primary。'
 table_exists="$(query "${PRIMARY_HOST}" "${PRIMARY_PORT}" "${BUSINESS_USER}" "${BUSINESS_PASSWORD}" "${BUSINESS_DATABASE}" "select (to_regclass('business.rw_probe') is not null)::text")"
-[[ "${table_exists}" == 'true' ]] || die 'Primary 缺少 business.rw_probe；请先加载项目测试数据。'
+[[ "${table_exists}" == 'true' ]] || die 'Primary 缺少 business.rw_probe；安装阶段的自动初始化未完成，请检查安装日志中的 PG_RW_SQL_STAGE。'
 
 probe_key="route-$(date +%s)-$$"
 insert_node="$(query '127.0.0.1' "${PGPOOL_PORT}" "${BUSINESS_USER}" "${BUSINESS_PASSWORD}" "${BUSINESS_DATABASE}" \

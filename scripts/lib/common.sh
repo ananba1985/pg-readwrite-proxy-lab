@@ -8,10 +8,38 @@ PROJECT_ROOT="$(cd -- "${COMMON_DIR}/../.." && pwd)"
 CLUSTER_CONFIG="${CLUSTER_CONFIG:-${PROJECT_ROOT}/config/cluster.env}"
 SECRETS_CONFIG="${SECRETS_CONFIG:-${PROJECT_ROOT}/config/secrets.env}"
 POOL_USERS_FILE="${POOL_USERS_FILE:-${PROJECT_ROOT}/config/pool-users.txt}"
+SCRIPT_PHASE="${SCRIPT_PHASE:-脚本初始化}"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
-die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+set_script_phase() {
+  SCRIPT_PHASE="$1"
+  log "阶段=${SCRIPT_PHASE}"
+}
+die() {
+  local source_file="${BASH_SOURCE[1]:-$0}" line_number="${BASH_LINENO[0]:-unknown}"
+  printf '[ERROR] time=%s host=%s entry=%s source=%s line=%s phase=%s exit=1 pwd=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "${HOSTNAME:-unknown}" "${0##*/}" "${source_file##*/}" \
+    "${line_number}" "${SCRIPT_PHASE}" "${PWD}" >&2
+  printf '[ERROR] %s\n' "$*" >&2
+  exit 1
+}
+report_unexpected_script_error() {
+  local exit_code="$1" line_number="$2" source_file="$3" failed_command="$4" stack_index
+  ((BASH_SUBSHELL == 0)) || return "${exit_code}"
+  trap - ERR
+  printf '[ERROR] time=%s host=%s entry=%s source=%s line=%s phase=%s exit=%s pwd=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "${HOSTNAME:-unknown}" "${0##*/}" "${source_file##*/}" \
+    "${line_number}" "${SCRIPT_PHASE}" "${exit_code}" "${PWD}" >&2
+  printf '[ERROR] failed_command=%s\n' "${failed_command}" >&2
+  for ((stack_index=1; stack_index<${#FUNCNAME[@]}; stack_index++)); do
+    printf '[ERROR] stack[%s]=source=%s line=%s function=%s\n' \
+      "${stack_index}" "${BASH_SOURCE[${stack_index}]:-unknown}" \
+      "${BASH_LINENO[$((stack_index-1))]:-unknown}" "${FUNCNAME[${stack_index}]:-main}" >&2
+  done
+  return "${exit_code}"
+}
+trap 'report_unexpected_script_error "$?" "$LINENO" "${BASH_SOURCE[0]:-$0}" "$BASH_COMMAND"' ERR
 
 require_root() {
   [[ "${EUID}" -eq 0 ]] || die '请使用 root，或通过 sudo 执行此脚本。'
@@ -163,6 +191,22 @@ assert_kylin_v10_arm64() {
     die "只支持 Kylin Linux Advanced Server V10 aarch64；检测到 ${pretty_name:-unknown} ${architecture}。"
 }
 
+assert_supported_db_platform() {
+  local os_id="$1" version_id="$2" architecture="$3" pretty_name="$4"
+  [[ "${architecture}" == 'aarch64' ]] || \
+    die "数据库节点只支持 aarch64；检测到 ${pretty_name:-unknown} ${architecture}。"
+  case "${os_id}:${version_id}" in
+    kylin:V10)
+      ;;
+    centos:7|centos:7.*)
+      warn "检测到 CentOS 7 ARM64 数据库实验节点；仅用于本项目虚拟机端到端测试，生产基线仍为麒麟 V10。"
+      ;;
+    *)
+      die "数据库节点平台不受支持：${pretty_name:-unknown} ${architecture}；只允许麒麟 V10 生产基线或 CentOS 7 ARM64 实验基线。"
+      ;;
+  esac
+}
+
 detect_kylin_v10_arm64() {
   [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
   # shellcheck disable=SC1091
@@ -173,7 +217,12 @@ detect_kylin_v10_arm64() {
 }
 
 detect_db_platform() {
-  detect_kylin_v10_arm64
+  [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  CPU_ARCH="$(uname -m)"
+  assert_supported_db_platform "${ID:-}" "${VERSION_ID:-}" "${CPU_ARCH}" "${PRETTY_NAME:-unknown}"
+  export CPU_ARCH
 }
 
 detect_pgpool_platform() {
@@ -246,7 +295,10 @@ pg_ctl_start() {
   local bin_dir="$1" pgdata="$2" log_file="$3"
   [[ ! -e "${log_file}" ]] || chown "${PG_OS_USER}:${PG_OS_USER}" "${log_file}"
   install -d -o "${PG_OS_USER}" -g "${PG_OS_USER}" -m 700 "$(dirname "${log_file}")"
-  run_as_pg "${bin_dir}" "${bin_dir}/pg_ctl" -w -t 120 -D "${pgdata}" -l "${log_file}" start
+  # pg_ctl -w 的超时只表示“等待窗口耗尽”，并不会终止已经拉起且仍在恢复的
+  # postmaster。大型 Standby 首次恢复可能超过 120 秒，因此这里只发起启动，
+  # 就绪与 streaming 等待由调用方按角色使用更长、可诊断的窗口完成。
+  run_as_pg "${bin_dir}" "${bin_dir}/pg_ctl" -W -D "${pgdata}" -l "${log_file}" start
 }
 
 wait_for_postgres() {
@@ -301,16 +353,31 @@ assert_safe_pgdata() {
 
 validate_standby_resume_state() {
   local state_file='/var/lib/pg-rw-proxy-installer/standby-bootstrap.state'
-  local key path found=0
-  [[ -f "${state_file}" ]] || return 1
-  while IFS='=' read -r key path; do
-    [[ "${key}" =~ ^(original_pgdata|partial_pgdata|original_or_partial_pgdata)$ ]] || \
-      die "Standby 恢复状态包含未知字段: ${key}"
-    [[ "${path}" == /var/backups/pg-readwrite-proxy-lab/standby-* && -d "${path}" ]] || \
-      die "Standby 恢复状态指向无效备份目录: ${path}"
-    found=1
+  local key value backup_found=0
+  [[ -f "${state_file}" && ! -L "${state_file}" ]] || return 1
+  [[ "$(stat -c '%U:%a' "${state_file}")" == 'root:600' ]] || \
+    die "Standby 恢复状态文件所有者或权限异常: ${state_file}"
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      original_pgdata|partial_pgdata|original_or_partial_pgdata)
+        [[ "${value}" == /var/backups/pg-readwrite-proxy-lab/standby-* && -d "${value}" ]] || \
+          die "Standby 恢复状态指向无效备份目录: ${value}"
+        backup_found=1
+        ;;
+      basebackup_complete)
+        [[ "${value}" == yes ]] || die "Standby 恢复状态字段 ${key} 无效: ${value}"
+        ;;
+      pgdata)
+        [[ "${value}" == "${STANDBY_PGDATA:-}" ]] || die "Standby 恢复状态 PGDATA 与当前配置不一致: ${value}"
+        ;;
+      primary_system_id)
+        [[ "${value}" =~ ^[0-9]+$ ]] || die "Standby 恢复状态 system identifier 无效: ${value}"
+        ;;
+      '') ;;
+      *) die "Standby 恢复状态包含未知字段: ${key}" ;;
+    esac
   done <"${state_file}"
-  ((found == 1)) || die 'Standby 恢复状态文件为空。'
+  ((backup_found == 1)) || die 'Standby 恢复状态缺少原数据备份目录。'
   STANDBY_RESUME_STATE_FILE="${state_file}"
   export STANDBY_RESUME_STATE_FILE
 }
