@@ -71,7 +71,7 @@ load_cluster_config() {
     STANDBY_HOST STANDBY_PORT STANDBY_PGDATA STANDBY_PG_BIN_DIR STANDBY_ADMIN_TOOL STANDBY_LISTEN_ADDRESSES
     STANDBY_APPLICATION_NAME REPLICATION_SLOT_NAME
     PGPOOL_HOST PGPOOL_PORT PCP_PORT PGPOOL_SERVICE PGPOOL_CONFIG_DIR
-    STANDBY_ADDRESS_CIDR PGPOOL_ADDRESS_CIDR ALLOWED_CLIENT_CIDRS MANAGE_DB_FIREWALL MANAGE_PGPOOL_FIREWALL
+    STANDBY_ADDRESS_CIDR PGPOOL_ADDRESS_CIDR ALLOWED_CLIENT_CIDRS
     REPLICATION_USER MONITOR_USER BUSINESS_USER BUSINESS_DATABASE PCP_USER
     MAX_WAL_SENDERS MAX_REPLICATION_SLOTS WAL_KEEP_SEGMENTS
     PRIMARY_READ_WEIGHT STANDBY_READ_WEIGHT DISABLE_LOAD_BALANCE_ON_WRITE READ_LAG_THRESHOLD_SECONDS
@@ -91,8 +91,6 @@ load_cluster_config() {
   [[ "${PGPOOL_INSTALL_PREFIX}" == '/opt/pgpool-II-4.7.2' && "${PG_CLIENT_PREFIX}" == '/opt/pgpool-client-12.0' && \
      "${PGPOOL_RUNTIME_PREFIX}" == '/opt/pgpool-runtime-kylin-v10' ]] || die 'Pgpool 离线运行时前缀不是已验收值。'
   [[ "${DISABLE_LOAD_BALANCE_ON_WRITE}" =~ ^(off|transaction|trans_transaction|always|dml_adaptive)$ ]] || die 'DISABLE_LOAD_BALANCE_ON_WRITE 无效。'
-  [[ "${MANAGE_DB_FIREWALL}" =~ ^(yes|no)$ ]] || die 'MANAGE_DB_FIREWALL 只能是 yes 或 no。'
-  [[ "${MANAGE_PGPOOL_FIREWALL}" =~ ^(yes|no)$ ]] || die 'MANAGE_PGPOOL_FIREWALL 只能是 yes 或 no。'
   [[ "${APPLY_PRIMARY_RESTART}" =~ ^(yes|no)$ ]] || die 'APPLY_PRIMARY_RESTART 只能是 yes 或 no。'
   [[ "${ALLOW_STANDBY_REINITIALIZE}" =~ ^(yes|no)$ ]] || die 'ALLOW_STANDBY_REINITIALIZE 只能是 yes 或 no。'
   for name in PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_SHA256 PGPOOL_RUNTIME_PAYLOAD_SHA256 SSHPASS_PAYLOAD_SHA256; do
@@ -321,15 +319,6 @@ sql_literal() {
   local value="$1"
   value="${value//\'/\'\'}"
   printf "'%s'" "${value}"
-}
-
-add_firewall_rule() {
-  local enabled="$1" cidr="$2" port="$3" scope="$4" rule
-  [[ "${enabled}" == 'yes' ]] || { warn "${scope} 防火墙托管=no：未添加 ${cidr} -> TCP/${port}；请确认上游防火墙。"; return 0; }
-  systemctl is-active --quiet firewalld || die "${scope} 防火墙托管=yes，但 firewalld 未运行。"
-  rule="rule family=\"ipv4\" source address=\"${cidr}\" port port=\"${port}\" protocol=\"tcp\" accept"
-  firewall-cmd --permanent --query-rich-rule="${rule}" >/dev/null 2>&1 || firewall-cmd --permanent --add-rich-rule="${rule}" >/dev/null
-  firewall-cmd --reload >/dev/null
 }
 
 tcp_check() {

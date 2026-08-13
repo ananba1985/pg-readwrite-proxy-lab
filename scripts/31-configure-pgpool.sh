@@ -94,9 +94,6 @@ printf '# USERID:MD5PASSWD\n%s:%s\n' "${PCP_USER}" "${pcp_hash}" >"${PGPOOL_CONF
 chown root:pgpool "${PGPOOL_CONFIG_DIR}/pcp.conf"
 chmod 640 "${PGPOOL_CONFIG_DIR}/pcp.conf"
 
-for cidr in "${client_cidrs[@]}"; do
-  add_firewall_rule "${MANAGE_PGPOOL_FIREWALL}" "$(trim "${cidr}")" "${PGPOOL_PORT}" 'Pgpool 节点'
-done
 systemctl enable "${PGPOOL_SERVICE}" >/dev/null
 systemctl restart "${PGPOOL_SERVICE}"
 wait_for_postgres "${PG_CLIENT_PREFIX}/bin" 127.0.0.1 "${PGPOOL_PORT}" 60 || {

@@ -84,9 +84,4 @@ case "${ROLE}" in
     ;;
 esac
 
-if systemctl is-active --quiet firewalld 2>/dev/null; then
-  log 'firewalld=active'
-else
-  warn 'firewalld 未运行；对应角色未托管防火墙时，必须由上游网络策略放行精确端口。'
-fi
 log '只读预检通过。'

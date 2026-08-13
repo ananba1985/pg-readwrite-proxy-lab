@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# 部署前只读就绪门禁。它不得修改数据库、服务、配置、账号或防火墙。
+# 部署前只读就绪门禁。它不得修改数据库、服务、配置或账号。
 set -Eeuo pipefail
 IFS=$'\n\t'
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -257,7 +257,7 @@ case "${ROLE}" in
   pgpool)
     detect_pgpool_platform
     assert_local_ipv4 "${PGPOOL_HOST}" PGPOOL_HOST
-    require_commands systemctl tar gzip ldd firewall-cmd openssl pgrep useradd getent md5sum readelf strings
+    require_commands systemctl tar gzip ldd openssl pgrep useradd getent md5sum readelf strings
     assert_rw_mount /opt 'Pgpool 安装目录'
     assert_rw_mount /etc 'Pgpool 配置目录'
     assert_rw_mount /var 'Pgpool 状态/备份目录'
@@ -297,10 +297,6 @@ case "${ROLE}" in
     ping -c 1 -W 2 "${STANDBY_HOST}" >/dev/null || die "Pgpool 无法 ping Standby ${STANDBY_HOST}。"
     tcp_check "${PRIMARY_HOST}" "${PRIMARY_PORT}" || die 'Pgpool 无法连接 Primary 数据库端口。'
     tcp_check "${STANDBY_HOST}" "${STANDBY_PORT}" || die 'Pgpool 无法连接 Standby 数据库端口。'
-    if [[ "${MANAGE_PGPOOL_FIREWALL}" == 'yes' ]]; then
-      systemctl is-active --quiet firewalld || die '要求托管麒麟防火墙，但 firewalld 未运行。'
-      firewall-cmd --state >/dev/null || die 'root 无法读取 firewalld 状态。'
-    fi
     for port in "${PGPOOL_PORT}" "${PCP_PORT}"; do
       if ss -ltnH "sport = :${port}" | grep -q .; then
         [[ "${service_active}" == yes ]] || die "TCP/${port} 正在监听，但本项目 ${PGPOOL_SERVICE} 服务并非 active。"
@@ -373,8 +369,8 @@ case "${ROLE}" in
     check_backup_capacity /opt "$((extracted_bytes + extracted_bytes / 2 + 536870912))" 'Pgpool /opt 文件系统'
     cleanup_payload_test
     trap - EXIT
-    printf 'READINESS_PGPOOL=READY platform=%s payload_bytes=%s firewalld_managed=%s\n' \
-      "${PRETTY_NAME}" "${payload_bytes}" "${MANAGE_PGPOOL_FIREWALL}"
+    printf 'READINESS_PGPOOL=READY platform=%s payload_bytes=%s host_network_policy=external\n' \
+      "${PRETTY_NAME}" "${payload_bytes}"
     printf 'READINESS_PGPOOL_BACKENDS=READY primary_pids=%s standby_pids=%s\n' \
       "${existing_primary_pids}" "${existing_standby_pids}"
     ;;

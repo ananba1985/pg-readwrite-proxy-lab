@@ -134,8 +134,6 @@ replace_managed_block "${STANDBY_PGDATA}/postgresql.conf" PG_RW_PROXY_INCLUDE "$
 sed -Ei '/^[[:space:]]*host[[:space:]]+replication[[:space:]]+repl[[:space:]]+0\.0\.0\.0\/0[[:space:]]+md5([[:space:]]*(#.*)?)?$/d' "${STANDBY_PGDATA}/pg_hba.conf"
 chown -R "${PG_OS_USER}:${PG_OS_USER}" "${STANDBY_PGDATA}"
 chmod 700 "${STANDBY_PGDATA}"
-add_firewall_rule "${MANAGE_DB_FIREWALL}" "${PGPOOL_ADDRESS_CIDR}" "${STANDBY_PORT}" '数据库节点'
-
 if pg_ctl_is_running "${STANDBY_PG_BIN_DIR}" "${STANDBY_PGDATA}"; then
   enforce_restart_connection_policy Standby "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" '数据库重启前'
 fi

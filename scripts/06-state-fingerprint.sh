@@ -44,15 +44,14 @@ case "${ROLE}" in
       "$(hash_or_absent "${pgdata}/postgresql.auto.conf")" "$(hash_or_absent "${pgdata}/conf.d/99-pg-rw-proxy.conf")"
     ;;
   pgpool)
-    for command_name in systemctl ss sha256sum awk find sort xargs firewall-cmd; do require_command "${command_name}"; done
+    for command_name in systemctl ss sha256sum awk find sort xargs; do require_command "${command_name}"; done
     service_state="$(systemctl is-active "${PGPOOL_SERVICE}" 2>/dev/null || true)"
     listen_hash="$(ss -ltnH "sport = :${PGPOOL_PORT} or sport = :${PCP_PORT}" 2>/dev/null | sha256sum | awk '{print $1}')"
-    firewall_hash="$(firewall-cmd --list-all --permanent 2>/dev/null | sha256sum | awk '{print $1}')"
-    printf 'pgpool|service=%s|listen=%s|unit=%s|config=%s|runtime=%s|client=%s|binary=%s|firewall=%s\n' \
+    printf 'pgpool|service=%s|listen=%s|unit=%s|config=%s|runtime=%s|client=%s|binary=%s\n' \
       "${service_state:-unknown}" "${listen_hash}" "$(hash_or_absent "/etc/systemd/system/${PGPOOL_SERVICE}.service")" \
       "$(tree_hash_or_absent "${PGPOOL_CONFIG_DIR}")" \
       "$([[ -e "${PGPOOL_RUNTIME_PREFIX}" ]] && printf present || printf absent)" \
       "$([[ -e "${PG_CLIENT_PREFIX}" ]] && printf present || printf absent)" \
-      "$([[ -e "${PGPOOL_INSTALL_PREFIX}" ]] && printf present || printf absent)" "${firewall_hash}"
+      "$([[ -e "${PGPOOL_INSTALL_PREFIX}" ]] && printf present || printf absent)"
     ;;
 esac

@@ -118,8 +118,6 @@ for setting_name in "${!expected_postmaster[@]}"; do
 done
 grep -Eq '^[[:space:]]*host[[:space:]]+replication[[:space:]]+repl[[:space:]]+0\.0\.0\.0/0' "${pg_hba_conf}" && die '旧的全网 replication HBA 规则仍然存在。'
 
-add_firewall_rule "${MANAGE_DB_FIREWALL}" "${STANDBY_ADDRESS_CIDR}" "${PRIMARY_PORT}" '数据库节点'
-add_firewall_rule "${MANAGE_DB_FIREWALL}" "${PGPOOL_ADDRESS_CIDR}" "${PRIMARY_PORT}" '数据库节点'
 effective_before="$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres \
   "select current_setting('cluster_name'),current_setting('listen_addresses'),current_setting('wal_level'),current_setting('max_wal_senders'),current_setting('max_replication_slots'),current_setting('wal_keep_segments')")"
 expected_effective="rw-primary|${PRIMARY_LISTEN_ADDRESSES}|replica|${MAX_WAL_SENDERS}|${MAX_REPLICATION_SLOTS}|${WAL_KEEP_SEGMENTS}"

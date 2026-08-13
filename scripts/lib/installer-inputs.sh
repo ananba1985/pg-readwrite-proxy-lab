@@ -17,7 +17,7 @@ show_install_usage() {
   --pgpool-port PORT               Pgpool-II 对外服务端口，默认 5432
   --ssh-port PORT                  Primary/Standby 共用 root SSH 端口，默认 22
   --allowed-client-cidrs CIDRS     允许访问 Pgpool 的 IPv4 CIDR，多个值用逗号分隔
-  --manage-pgpool-firewall yes|no  是否由安装器管理 Pgpool firewalld，默认 yes
+  --manage-pgpool-firewall VALUE   已废弃兼容参数；接受但忽略，不执行防火墙操作
   --business-user USER             现有业务数据库用户名
   --business-database DATABASE     现有业务数据库名
   --root-ssh-password PASSWORD     Primary/Standby 共用 root SSH 密码
