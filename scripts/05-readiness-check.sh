@@ -134,8 +134,9 @@ case "${ROLE}" in
     expected_pgpool_pids="$(validated_pid_list "${EXPECTED_PGPOOL_PRIMARY_PIDS:-none}" EXPECTED_PGPOOL_PRIMARY_PIDS)"
     active_client_sessions="$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres \
       "select count(*) from pg_stat_activity where backend_type='client backend' and pid<>pg_backend_pid() and not (client_addr='${PGPOOL_HOST}'::inet and pid in (${expected_pgpool_pids}) and usename='${BUSINESS_USER}' and datname='${BUSINESS_DATABASE}')")"
-    [[ "${active_client_sessions}" == '0' ]] || \
-      die "Primary 仍有 ${active_client_sessions} 个非受信任的活动/空闲客户端连接；重启前必须停止全部业务连接池。"
+    [[ "${active_client_sessions}" =~ ^[0-9]+$ ]] || die '无法统计 Primary 客户端连接数。'
+    ((active_client_sessions == 0)) || \
+      warn "Primary 检测到 ${active_client_sessions} 个客户端连接；技术检查继续，一键入口随后要求人工选择退出或强制中断。"
     custom_tablespaces="$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres \
       "select count(*) from pg_tablespace where pg_tablespace_location(oid) <> ''")"
     [[ "${custom_tablespaces}" == '0' ]] || die 'Primary 存在自定义表空间，当前安装器不猜测 Standby 映射。'
@@ -167,8 +168,9 @@ case "${ROLE}" in
     ping -c 1 -W 2 "${STANDBY_HOST}" >/dev/null || die "Primary 无法 ping Standby ${STANDBY_HOST}。"
     ping -c 1 -W 2 "${PGPOOL_HOST}" >/dev/null || die "Primary 无法 ping Pgpool ${PGPOOL_HOST}。"
     tcp_check "${STANDBY_HOST}" "${STANDBY_PORT}" || die 'Primary 无法连接 Standby 当前数据库端口。'
-    printf 'READINESS_PRIMARY=READY system_id=%s pgdata_bytes=%s active_client_sessions=0\n' \
-      "$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres 'select system_identifier from pg_control_system()')" "${primary_bytes}"
+    printf 'READINESS_PRIMARY=READY system_id=%s pgdata_bytes=%s active_client_sessions=%s\n' \
+      "$(nebula_admin_query "${PRIMARY_ADMIN_TOOL}" "${PRIMARY_PORT}" postgres 'select system_identifier from pg_control_system()')" \
+      "${primary_bytes}" "${active_client_sessions}"
     ;;
 
   standby)
@@ -195,7 +197,9 @@ case "${ROLE}" in
     expected_pgpool_pids="$(validated_pid_list "${EXPECTED_PGPOOL_STANDBY_PIDS:-none}" EXPECTED_PGPOOL_STANDBY_PIDS)"
     standby_sessions="$(nebula_admin_query "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" postgres \
       "select count(*) from pg_stat_activity where backend_type='client backend' and pid<>pg_backend_pid() and not (client_addr='${PGPOOL_HOST}'::inet and pid in (${expected_pgpool_pids}) and usename='${BUSINESS_USER}' and datname='${BUSINESS_DATABASE}')")"
-    [[ "${standby_sessions}" == '0' ]] || die "Standby 仍有 ${standby_sessions} 个客户端连接，维护窗口未清空。"
+    [[ "${standby_sessions}" =~ ^[0-9]+$ ]] || die '无法统计 Standby 客户端连接数。'
+    ((standby_sessions == 0)) || \
+      warn "Standby 检测到 ${standby_sessions} 个客户端连接；技术检查继续，一键入口随后要求人工选择退出或强制中断。"
     config_errors="$(nebula_admin_query "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" postgres \
       "select count(*) from pg_file_settings where error is not null and not (error='setting could not be applied' and name in ('listen_addresses','cluster_name','hot_standby'))")"
     hba_errors="$(nebula_admin_query "${STANDBY_ADMIN_TOOL}" "${STANDBY_PORT}" postgres \
@@ -246,7 +250,8 @@ case "${ROLE}" in
     ip route get "${PGPOOL_HOST}" >/dev/null || die "Standby 没有到 Pgpool ${PGPOOL_HOST} 的路由。"
     ping -c 1 -W 2 "${PRIMARY_HOST}" >/dev/null || die "Standby 无法 ping Primary ${PRIMARY_HOST}。"
     ping -c 1 -W 2 "${PGPOOL_HOST}" >/dev/null || die "Standby 无法 ping Pgpool ${PGPOOL_HOST}。"
-    printf 'READINESS_STANDBY=READY recovery=%s system_id=%s pgdata_bytes=%s\n' "${recovery}" "${system_id}" "${standby_bytes}"
+    printf 'READINESS_STANDBY=READY recovery=%s system_id=%s pgdata_bytes=%s active_client_sessions=%s\n' \
+      "${recovery}" "${system_id}" "${standby_bytes}" "${standby_sessions}"
     ;;
 
   pgpool)

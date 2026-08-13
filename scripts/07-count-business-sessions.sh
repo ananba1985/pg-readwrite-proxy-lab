@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# APPLY 后、修改数据库前调用。既有 Pgpool 已停止时，必须证明所有普通客户端连接均已释放。
+# APPLY 后、修改数据库前调用。既有 Pgpool 停止后重新统计普通客户端连接，供零连接门禁或人工强制授权判断。
 set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh

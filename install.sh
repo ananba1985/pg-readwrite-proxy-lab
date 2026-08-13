@@ -12,6 +12,12 @@ STATE_DIR='/var/lib/pg-rw-proxy-installer'
 log() { printf '[INSTALL] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+# shellcheck source=scripts/lib/installer-inputs.sh
+source "${ROOT_DIR}/scripts/lib/installer-inputs.sh"
+initialize_install_inputs
+parse_install_inputs "$@"
+
 [[ "${EUID}" -eq 0 ]] || die '请在 Pgpool-II 服务器上使用 root 运行 bash install.sh。'
 for command_name in ssh tar openssl awk sed sha256sum mktemp getenforce getconf uname id stat df; do
   command -v "${command_name}" >/dev/null 2>&1 || die "缺少系统基础命令: ${command_name}"
@@ -43,23 +49,6 @@ for payload in "${expected_payloads[@]}"; do
 done
 (cd "${ROOT_DIR}/packages" && sha256sum -c MANIFEST.sha256) || die '离线载荷完整性校验失败。'
 
-prompt_default() {
-  local variable_name="$1" prompt_text="$2" default_value="$3" value
-  read -r -p "${prompt_text} [${default_value}]: " value
-  printf -v "${variable_name}" '%s' "${value:-${default_value}}"
-}
-
-prompt_secret() {
-  local variable_name="$1" prompt_text="$2" colon_policy="${3:-deny}" value=''
-  while [[ -z "${value}" ]]; do
-    read -r -s -p "${prompt_text}: " value
-    printf '\n'
-  done
-  [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] || die '密码不能包含换行。'
-  [[ "${colon_policy}" == allow || "${value}" != *:* ]] || die '数据库密码不能包含冒号。'
-  printf -v "${variable_name}" '%s' "${value}"
-}
-
 is_ipv4() {
   local ip="$1" octet old_ifs="${IFS}"
   [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -84,7 +73,7 @@ validate_port() {
 }
 
 printf '\nPostgreSQL Streaming Replication + Pgpool-II 离线安装\n'
-printf '目标平台：Pgpool 节点为麒麟 V10 aarch64；数据库节点为 CentOS 7 aarch64 且已安装受支持的 NebulaCM PostgreSQL 12.0。\n\n'
+printf '目标平台：Primary、Standby 与 Pgpool 节点均为麒麟 V10 aarch64；数据库节点已安装受支持的 NebulaCM PostgreSQL 12.0。\n\n'
 prompt_default PGPOOL_HOST '当前 Pgpool-II 服务器内网 IPv4 地址' '192.168.80.140'
 prompt_default PRIMARY_HOST '现有 PostgreSQL Primary 内网 IPv4 地址' '192.168.80.110'
 prompt_default STANDBY_HOST 'PostgreSQL Standby 目标机内网 IPv4 地址' '192.168.80.120'
@@ -93,11 +82,12 @@ for address in "${PGPOOL_HOST}" "${PRIMARY_HOST}" "${STANDBY_HOST}"; do is_ipv4 
 
 prompt_default PRIMARY_PORT 'PostgreSQL 端口' '5432'
 STANDBY_PORT="${PRIMARY_PORT}"
-prompt_default PGPOOL_PORT 'Pgpool-II 对外服务端口' '9999'
-prompt_default SSH_PORT 'Pgpool 服务器访问两个数据库节点的 root SSH 端口' '22'
-validate_port "${PRIMARY_PORT}"; validate_port "${PGPOOL_PORT}"; validate_port "${SSH_PORT}"
-[[ "${PGPOOL_PORT}" != "${PRIMARY_PORT}" && "${PGPOOL_PORT}" != "${SSH_PORT}" && \
-   "${PGPOOL_PORT}" != '9898' ]] || die 'Pgpool 对外端口不能与 PostgreSQL、SSH 或 PCP 端口冲突。'
+prompt_default PGPOOL_PORT 'Pgpool-II 对外服务端口' '5432'
+prompt_default SSH_PORT 'Pgpool 服务器访问 Primary 与 Standby 的 root SSH 端口' '22'
+validate_port "${PRIMARY_PORT}"
+validate_port "${PGPOOL_PORT}"
+validate_port "${SSH_PORT}"
+[[ "${PGPOOL_PORT}" != '9898' ]] || die 'Pgpool 对外端口不能与本机 PCP 端口 9898 冲突。'
 prompt_default ALLOWED_CLIENT_CIDRS '允许访问 Pgpool 的客户端 IPv4 CIDR（逗号分隔）' "${PGPOOL_HOST%.*}.0/24"
 IFS=',' read -r -a _allowed_cidrs <<<"${ALLOWED_CLIENT_CIDRS}"
 ((${#_allowed_cidrs[@]} > 0)) || die '客户端 CIDR 不能为空。'
@@ -159,6 +149,7 @@ declare -A values=(
   [PG_CLIENT_PAYLOAD_FILE]='postgresql-client-12.0-aarch64-kylin-v10.tar.gz' [PG_CLIENT_PAYLOAD_SHA256]='1314901d8b0de906fcc47c7784913fd347d07a3b563475f8eae4e16310ba8667'
   [PGPOOL_RUNTIME_PAYLOAD_FILE]='pgpool-runtime-kylin-v10-aarch64.tar.gz' [PGPOOL_RUNTIME_PAYLOAD_SHA256]='6d00411d0098b2bab0c3f9e3a0d5d009907189eb2b0e3a743edd3063bce9a257'
   [SSHPASS_PAYLOAD_FILE]='sshpass-1.10-aarch64-kylin-v10.tar.gz' [SSHPASS_PAYLOAD_SHA256]='84bcff17fc7e48d0a8552c985818e17e485f95a66b3c50c4eedde6bcbdc96ffd'
+  [SSH_PORT]="${SSH_PORT}"
   [PRIMARY_HOST]="${PRIMARY_HOST}" [PRIMARY_PORT]="${PRIMARY_PORT}" [PRIMARY_PGDATA]='/pgsql/12/data'
   [PRIMARY_PG_BIN_DIR]='/opt/pgsql12/bin' [PRIMARY_ADMIN_TOOL]='/opt/pgsql12/bin/tools' [PRIMARY_LISTEN_ADDRESSES]="127.0.0.1,${PRIMARY_HOST}"
   [STANDBY_HOST]="${STANDBY_HOST}" [STANDBY_PORT]="${STANDBY_PORT}" [STANDBY_PGDATA]='/pgsql/12/data'
@@ -176,7 +167,7 @@ declare -A values=(
   [NUM_INIT_CHILDREN]='8' [MAX_POOL]='2' [CONNECTION_LIFE_TIME]='600' [LOG_PER_NODE_STATEMENT]='on'
   [APPLY_PRIMARY_RESTART]='yes' [ALLOW_STANDBY_REINITIALIZE]='yes'
 )
-order=(PG_MAJOR PG_VERSION_FULL DB_DISTRIBUTION DBN_VERSION_MARKER DB_POSTGRES_SHA256 DB_PG_BASEBACKUP_SHA256 DB_PG_CONFIG_SHA256 DB_TOOLS_SHA256 PG_OS_USER PGPOOL_MAJOR PGPOOL_VERSION PGPOOL_INSTALL_PREFIX PG_CLIENT_PREFIX PGPOOL_RUNTIME_PREFIX OFFLINE_PACKAGE_DIR PGPOOL_PAYLOAD_FILE PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_FILE PG_CLIENT_PAYLOAD_SHA256 PGPOOL_RUNTIME_PAYLOAD_FILE PGPOOL_RUNTIME_PAYLOAD_SHA256 SSHPASS_PAYLOAD_FILE SSHPASS_PAYLOAD_SHA256 PRIMARY_HOST PRIMARY_PORT PRIMARY_PGDATA PRIMARY_PG_BIN_DIR PRIMARY_ADMIN_TOOL PRIMARY_LISTEN_ADDRESSES STANDBY_HOST STANDBY_PORT STANDBY_PGDATA STANDBY_PG_BIN_DIR STANDBY_ADMIN_TOOL STANDBY_LISTEN_ADDRESSES STANDBY_APPLICATION_NAME REPLICATION_SLOT_NAME PGPOOL_HOST PGPOOL_PORT PCP_PORT PGPOOL_SERVICE PGPOOL_CONFIG_DIR STANDBY_ADDRESS_CIDR PGPOOL_ADDRESS_CIDR ALLOWED_CLIENT_CIDRS MANAGE_DB_FIREWALL MANAGE_PGPOOL_FIREWALL REPLICATION_USER MONITOR_USER BUSINESS_USER BUSINESS_DATABASE PCP_USER MAX_WAL_SENDERS MAX_REPLICATION_SLOTS WAL_KEEP_SEGMENTS PRIMARY_READ_WEIGHT STANDBY_READ_WEIGHT DISABLE_LOAD_BALANCE_ON_WRITE READ_LAG_THRESHOLD_SECONDS SR_CHECK_PERIOD HEALTH_CHECK_PERIOD HEALTH_CHECK_TIMEOUT HEALTH_CHECK_MAX_RETRIES HEALTH_CHECK_RETRY_DELAY CONNECT_TIMEOUT_MS NUM_INIT_CHILDREN MAX_POOL CONNECTION_LIFE_TIME LOG_PER_NODE_STATEMENT APPLY_PRIMARY_RESTART ALLOW_STANDBY_REINITIALIZE)
+order=(PG_MAJOR PG_VERSION_FULL DB_DISTRIBUTION DBN_VERSION_MARKER DB_POSTGRES_SHA256 DB_PG_BASEBACKUP_SHA256 DB_PG_CONFIG_SHA256 DB_TOOLS_SHA256 PG_OS_USER PGPOOL_MAJOR PGPOOL_VERSION PGPOOL_INSTALL_PREFIX PG_CLIENT_PREFIX PGPOOL_RUNTIME_PREFIX OFFLINE_PACKAGE_DIR PGPOOL_PAYLOAD_FILE PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_FILE PG_CLIENT_PAYLOAD_SHA256 PGPOOL_RUNTIME_PAYLOAD_FILE PGPOOL_RUNTIME_PAYLOAD_SHA256 SSHPASS_PAYLOAD_FILE SSHPASS_PAYLOAD_SHA256 SSH_PORT PRIMARY_HOST PRIMARY_PORT PRIMARY_PGDATA PRIMARY_PG_BIN_DIR PRIMARY_ADMIN_TOOL PRIMARY_LISTEN_ADDRESSES STANDBY_HOST STANDBY_PORT STANDBY_PGDATA STANDBY_PG_BIN_DIR STANDBY_ADMIN_TOOL STANDBY_LISTEN_ADDRESSES STANDBY_APPLICATION_NAME REPLICATION_SLOT_NAME PGPOOL_HOST PGPOOL_PORT PCP_PORT PGPOOL_SERVICE PGPOOL_CONFIG_DIR STANDBY_ADDRESS_CIDR PGPOOL_ADDRESS_CIDR ALLOWED_CLIENT_CIDRS MANAGE_DB_FIREWALL MANAGE_PGPOOL_FIREWALL REPLICATION_USER MONITOR_USER BUSINESS_USER BUSINESS_DATABASE PCP_USER MAX_WAL_SENDERS MAX_REPLICATION_SLOTS WAL_KEEP_SEGMENTS PRIMARY_READ_WEIGHT STANDBY_READ_WEIGHT DISABLE_LOAD_BALANCE_ON_WRITE READ_LAG_THRESHOLD_SECONDS SR_CHECK_PERIOD HEALTH_CHECK_PERIOD HEALTH_CHECK_TIMEOUT HEALTH_CHECK_MAX_RETRIES HEALTH_CHECK_RETRY_DELAY CONNECT_TIMEOUT_MS NUM_INIT_CHILDREN MAX_POOL CONNECTION_LIFE_TIME LOG_PER_NODE_STATEMENT APPLY_PRIMARY_RESTART ALLOW_STANDBY_REINITIALIZE)
 for name in "${order[@]}"; do write_env "${cluster_file}" "${name}" "${values[${name}]}"; done
 chmod 600 "${cluster_file}"
 
@@ -204,9 +195,13 @@ export SSHPASS="${ROOT_SSH_PASSWORD}"
 known_hosts="${STATE_DIR}/known_hosts"
 touch "${known_hosts}"; chmod 600 "${known_hosts}"
 ssh_args=(-p "${SSH_PORT}" -o PreferredAuthentications=password -o PubkeyAuthentication=no \
-  -o StrictHostKeyChecking=no -o UserKnownHostsFile="${known_hosts}" -o ConnectTimeout=10 -o ServerAliveInterval=15)
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile="${known_hosts}" \
+  -o ConnectTimeout=10 -o ServerAliveInterval=15)
 
-remote_root() { "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"$1" bash -s; }
+remote_root() {
+  local host="$1"
+  "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"${host}" bash -s
+}
 remote_command() { local host="$1" command_text="$2"; printf '%s\n' "${command_text}" | remote_root "${host}"; }
 
 stage_id="$(date '+%Y%m%d%H%M%S')-$$"
@@ -214,12 +209,15 @@ primary_stage="/var/tmp/pg-rw-proxy-installer-${stage_id}-primary"
 standby_stage="/var/tmp/pg-rw-proxy-installer-${stage_id}-standby"
 
 for host in "${PRIMARY_HOST}" "${STANDBY_HOST}"; do
-  log "校验 root SSH 和目标平台：${host}"
+  log "校验 root SSH 和目标平台：${host}:${SSH_PORT}"
   remote_root "${host}" <<'REMOTE_CHECK'
 set -e
 test "$(id -u)" -eq 0
 test "$(uname -m)" = aarch64
-grep -q 'release 7\.' /etc/centos-release
+test -r /etc/os-release
+. /etc/os-release
+test "${ID:-}" = kylin
+test "${VERSION_ID:-}" = V10
 REMOTE_CHECK
 done
 
@@ -267,11 +265,15 @@ printf '%s\n' "${primary_ready}"
 grep -Fq 'READINESS_RESULT=READY role=primary' <<<"${primary_ready}" || die 'Primary 严格就绪检查未返回 READY。'
 PRIMARY_SYSTEM_ID="$(sed -n 's/^READINESS_PRIMARY=READY system_id=\([0-9][0-9]*\) .*/\1/p' <<<"${primary_ready}")"
 PRIMARY_PGDATA_BYTES="$(sed -n 's/^READINESS_PRIMARY=READY .* pgdata_bytes=\([0-9][0-9]*\) .*/\1/p' <<<"${primary_ready}")"
-[[ "${PRIMARY_SYSTEM_ID}" =~ ^[0-9]+$ && "${PRIMARY_PGDATA_BYTES}" =~ ^[0-9]+$ ]] || die '无法解析 Primary 就绪检查上下文。'
+PRIMARY_CLIENT_SESSIONS="$(sed -n 's/^READINESS_PRIMARY=READY .* active_client_sessions=\([0-9][0-9]*\)$/\1/p' <<<"${primary_ready}")"
+[[ "${PRIMARY_SYSTEM_ID}" =~ ^[0-9]+$ && "${PRIMARY_PGDATA_BYTES}" =~ ^[0-9]+$ && \
+   "${PRIMARY_CLIENT_SESSIONS}" =~ ^[0-9]+$ ]] || die '无法解析 Primary 就绪检查上下文。'
 
 standby_ready="$(remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; PRIMARY_SYSTEM_ID='${PRIMARY_SYSTEM_ID}' PRIMARY_PGDATA_BYTES='${PRIMARY_PGDATA_BYTES}' EXPECTED_PGPOOL_STANDBY_PIDS='${existing_standby_pids}' ${remote_env} ./scripts/05-readiness-check.sh standby")"
 printf '%s\n' "${standby_ready}"
 grep -Fq 'READINESS_RESULT=READY role=standby' <<<"${standby_ready}" || die 'Standby 严格就绪检查未返回 READY。'
+STANDBY_CLIENT_SESSIONS="$(sed -n 's/^READINESS_STANDBY=READY .* active_client_sessions=\([0-9][0-9]*\)$/\1/p' <<<"${standby_ready}")"
+[[ "${STANDBY_CLIENT_SESSIONS}" =~ ^[0-9]+$ ]] || die '无法解析 Standby 客户端连接数。'
 primary_after="$(remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; ${remote_env} ./scripts/06-state-fingerprint.sh primary")"
 standby_after="$(remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; ${remote_env} ./scripts/06-state-fingerprint.sh standby")"
 pgpool_after="$("${ROOT_DIR}/scripts/06-state-fingerprint.sh" pgpool)"
@@ -279,21 +281,27 @@ pgpool_after="$("${ROOT_DIR}/scripts/06-state-fingerprint.sh" pgpool)"
 [[ "${standby_after}" == "${standby_baseline}" ]] || die 'Standby 在检查期间发生持久状态变化，拒绝继续。'
 [[ "${pgpool_after}" == "${pgpool_baseline}" ]] || die 'Pgpool 在检查期间发生持久状态变化，拒绝继续。'
 
+confirm_force_restart_with_clients "${PRIMARY_CLIENT_SESSIONS}" "${STANDBY_CLIENT_SESSIONS}"
+if [[ "${FORCE_DB_RESTART_WITH_CLIENTS}" == 'yes' ]]; then
+  warn "已取得本次运行的人工强制授权：Primary=${PRIMARY_CLIENT_SESSIONS}，Standby=${STANDBY_CLIENT_SESSIONS}；不会写入长期配置。"
+fi
+
 cat <<SUMMARY
 
 三节点只读就绪检查全部通过，尚未执行任何部署变更。
 
 检查范围：
-  权限/平台 : 本地 root、远端 root SSH、麒麟/CentOS 与 ARM64/glibc 基线、SELinux
+  权限/平台 : 本地 root、远端 root SSH、三节点麒麟 V10 ARM64 基线、Pgpool glibc、SELinux
   命令/路径 : 所有部署命令、数据库厂商运行时哈希、PGDATA/配置/HOME/安装前缀、挂载与 inode 属性
   数据库状态 : Primary/Standby 身份、业务对象/密码/探针、活动连接、配置解析、表空间、复制连接/槽
   网络/容量 : 三机路由/ping、必要 TCP、端口归属、防火墙权限、配置备份/基础备份/安装空间
   离线载荷 : 四个载荷 SHA256、安全路径、试解压、全部可执行文件动态库闭包及固定版本
 
 就绪结果：
-  Primary : READY，${PRIMARY_HOST}:${PRIMARY_PORT}，无非项目业务连接，允许在维护窗口重启
-  Standby : READY，${STANDBY_HOST}:${STANDBY_PORT}，无非项目客户端连接，空间与安全移动条件满足
+  Primary : READY，DB=${PRIMARY_HOST}:${PRIMARY_PORT}，SSH=${PRIMARY_HOST}:${SSH_PORT}，客户端连接=${PRIMARY_CLIENT_SESSIONS}
+  Standby : READY，DB=${STANDBY_HOST}:${STANDBY_PORT}，SSH=${STANDBY_HOST}:${SSH_PORT}，客户端连接=${STANDBY_CLIENT_SESSIONS}
   Pgpool  : READY，${PGPOOL_HOST}:${PGPOOL_PORT}，麒麟载荷/依赖/权限/防火墙条件满足
+  连接处理 : 强制中断授权=${FORCE_DB_RESTART_WITH_CLIENTS}
 
 确认后将执行：
   Primary : 备份配置、创建复制/监控账号、收紧 HBA、pg_ctl 重启
@@ -323,8 +331,20 @@ if [[ "${pgpool_was_active}" == yes ]]; then
     [[ "${primary_remaining_sessions}" == '0' && "${standby_remaining_sessions}" == '0' ]] && break
     sleep 1
   done
-  [[ "${primary_remaining_sessions}" == '0' && "${standby_remaining_sessions}" == '0' ]] || \
-    die "停止既有 Pgpool 后，后端连接未在 30 秒内释放：Primary=${primary_remaining_sessions}, Standby=${standby_remaining_sessions}。"
+else
+  primary_remaining_sessions="$(remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; ${remote_env} ./scripts/07-count-business-sessions.sh")"
+  standby_remaining_sessions="$(remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; ${remote_env} ./scripts/07-count-business-sessions.sh")"
+fi
+[[ "${primary_remaining_sessions}" =~ ^[0-9]+$ && "${standby_remaining_sessions}" =~ ^[0-9]+$ ]] || \
+  die 'APPLY 后无法重新统计数据库客户端连接。'
+if [[ "${primary_remaining_sessions}" != '0' || "${standby_remaining_sessions}" != '0' ]]; then
+  if [[ "${FORCE_DB_RESTART_WITH_CLIENTS}" != 'yes' ]]; then
+    warn "APPLY 后检测到新的数据库连接，尚未修改持久配置；需要重新选择连接处理策略。"
+    confirm_force_restart_with_clients "${primary_remaining_sessions}" "${standby_remaining_sessions}"
+  fi
+  warn "数据库最终编排复核仍有连接：Primary=${primary_remaining_sessions}, Standby=${standby_remaining_sessions}；将按人工授权在 fast stop 时中断。"
+else
+  log 'APPLY 后数据库连接复核：Primary=0，Standby=0。'
 fi
 
 config_backup_dir="/var/backups/pg-readwrite-proxy-lab/installer-config-$(date '+%Y%m%d-%H%M%S')"
@@ -336,9 +356,9 @@ for config_name in cluster.env secrets.env pool-users.txt; do
 done
 
 log '1/4 备份并配置 Primary。'
-remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; ${remote_env} ./scripts/10-configure-primary.sh"
+remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; FORCE_DB_RESTART_WITH_CLIENTS='${FORCE_DB_RESTART_WITH_CLIENTS}' ${remote_env} ./scripts/10-configure-primary.sh"
 log '2/4 校验既有 NebulaCM 运行时并初始化 Standby。'
-remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; ${remote_env} ./scripts/20-install-postgresql-standby.sh; ${remote_env} ./scripts/21-bootstrap-standby.sh"
+remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; ${remote_env} ./scripts/20-install-postgresql-standby.sh; FORCE_DB_RESTART_WITH_CLIENTS='${FORCE_DB_RESTART_WITH_CLIENTS}' ${remote_env} ./scripts/21-bootstrap-standby.sh"
 log '3/4 离线安装并配置 Pgpool-II。'
 "${ROOT_DIR}/scripts/30-install-pgpool.sh"
 "${ROOT_DIR}/scripts/31-configure-pgpool.sh"

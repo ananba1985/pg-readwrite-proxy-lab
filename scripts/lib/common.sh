@@ -66,7 +66,7 @@ load_cluster_config() {
     PGPOOL_MAJOR PGPOOL_VERSION PGPOOL_INSTALL_PREFIX PG_CLIENT_PREFIX PGPOOL_RUNTIME_PREFIX OFFLINE_PACKAGE_DIR
     PGPOOL_PAYLOAD_FILE PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_FILE PG_CLIENT_PAYLOAD_SHA256
     PGPOOL_RUNTIME_PAYLOAD_FILE PGPOOL_RUNTIME_PAYLOAD_SHA256
-    SSHPASS_PAYLOAD_FILE SSHPASS_PAYLOAD_SHA256
+    SSHPASS_PAYLOAD_FILE SSHPASS_PAYLOAD_SHA256 SSH_PORT
     PRIMARY_HOST PRIMARY_PORT PRIMARY_PGDATA PRIMARY_PG_BIN_DIR PRIMARY_ADMIN_TOOL PRIMARY_LISTEN_ADDRESSES
     STANDBY_HOST STANDBY_PORT STANDBY_PGDATA STANDBY_PG_BIN_DIR STANDBY_ADMIN_TOOL STANDBY_LISTEN_ADDRESSES
     STANDBY_APPLICATION_NAME REPLICATION_SLOT_NAME
@@ -98,10 +98,11 @@ load_cluster_config() {
   for name in PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_SHA256 PGPOOL_RUNTIME_PAYLOAD_SHA256 SSHPASS_PAYLOAD_SHA256; do
     [[ "${!name}" =~ ^[0-9a-f]{64}$ ]] || die "${name} 必须是 64 位小写 SHA256。"
   done
-  for name in PRIMARY_PORT STANDBY_PORT PGPOOL_PORT PCP_PORT; do
+  for name in SSH_PORT PRIMARY_PORT STANDBY_PORT PGPOOL_PORT PCP_PORT; do
     [[ "${!name}" =~ ^[0-9]{1,5}$ ]] && ((10#${!name} >= 1 && 10#${!name} <= 65535)) || die "${name} 不是有效端口。"
   done
   [[ "${PRIMARY_PORT}" == "${STANDBY_PORT}" ]] || die '当前安装器要求 Primary 与 Standby 端口一致。'
+  [[ "${PGPOOL_PORT}" != "${PCP_PORT}" ]] || die 'Pgpool 对外端口不能与本机 PCP 端口相同。'
 
   validate_ipv4 "${PRIMARY_HOST}" PRIMARY_HOST
   validate_ipv4 "${STANDBY_HOST}" STANDBY_HOST
@@ -158,29 +159,29 @@ validate_offline_payloads() {
   verify_sha256 "$(offline_file "${SSHPASS_PAYLOAD_FILE}")" "${SSHPASS_PAYLOAD_SHA256}" 'sshpass 载荷'
 }
 
-detect_db_platform() {
+assert_kylin_v10_arm64() {
+  local os_id="$1" version_id="$2" architecture="$3" pretty_name="$4"
+  [[ "${os_id}" == 'kylin' && "${version_id}" == 'V10' && "${architecture}" == 'aarch64' ]] || \
+    die "只支持 Kylin Linux Advanced Server V10 aarch64；检测到 ${pretty_name:-unknown} ${architecture}。"
+}
+
+detect_kylin_v10_arm64() {
   [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
   # shellcheck disable=SC1091
   source /etc/os-release
-  local id_like="${ID_LIKE:-}"
-  [[ "${ID:-}" =~ ^(centos|rhel|rocky|almalinux)$ || "${id_like}" == *rhel* || "${id_like}" == *fedora* ]] || die "仅支持 CentOS/RHEL 兼容发行版。"
-  EL_MAJOR="${VERSION_ID%%.*}"
   CPU_ARCH="$(uname -m)"
-  [[ "${EL_MAJOR}" == '7' && "${CPU_ARCH}" == 'aarch64' ]] || die "当前离线载荷只验收 CentOS/RHEL 7 aarch64；检测到 ${PRETTY_NAME:-unknown} ${CPU_ARCH}。"
-  warn 'CentOS 7 与 PostgreSQL 12 均已停止主流维护；正式投产前必须完成安全与升级评审。'
-  export EL_MAJOR CPU_ARCH
+  assert_kylin_v10_arm64 "${ID:-}" "${VERSION_ID:-}" "${CPU_ARCH}" "${PRETTY_NAME:-unknown}"
+  export CPU_ARCH
+}
+
+detect_db_platform() {
+  detect_kylin_v10_arm64
 }
 
 detect_pgpool_platform() {
-  [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
-  # shellcheck disable=SC1091
-  source /etc/os-release
-  CPU_ARCH="$(uname -m)"
-  [[ "${ID:-}" == 'kylin' && "${VERSION_ID:-}" == 'V10' && "${CPU_ARCH}" == 'aarch64' ]] || \
-    die "当前 Pgpool 离线载荷只验收 Kylin Linux Advanced Server V10 aarch64；检测到 ${PRETTY_NAME:-unknown} ${CPU_ARCH}。"
+  detect_kylin_v10_arm64
   [[ "$(getconf GNU_LIBC_VERSION 2>/dev/null || true)" == 'glibc 2.28' ]] || \
     die "麒麟 glibc 基线不匹配：$(getconf GNU_LIBC_VERSION 2>/dev/null || printf unknown)。"
-  export CPU_ARCH
 }
 
 verify_nebula_runtime() {
@@ -208,6 +209,20 @@ nebula_admin_query() {
 nebula_admin_file() {
   local admin_tool="$1" port="$2" database="$3" sql_file="$4"
   (cd /tmp && "${admin_tool}" psql -d "${database}" -p "${port}" -f "${sql_file}")
+}
+
+enforce_restart_connection_policy() {
+  local label="$1" admin_tool="$2" port="$3" phase="$4" count
+  count="$(nebula_admin_query "${admin_tool}" "${port}" postgres \
+    "select count(*) from pg_stat_activity where backend_type='client backend' and pid<>pg_backend_pid()")"
+  [[ "${count}" =~ ^[0-9]+$ ]] || die "${label} ${phase}无法统计客户端连接。"
+  if ((count > 0)); then
+    [[ "${FORCE_DB_RESTART_WITH_CLIENTS:-no}" == 'yes' ]] || \
+      die "${label} ${phase}仍有 ${count} 个客户端连接；未获得强制中断授权。"
+    warn "${label} ${phase}仍有 ${count} 个客户端连接；将按本次人工授权使用 fast stop 中断会话。"
+  else
+    log "${label} ${phase}客户端连接=0。"
+  fi
 }
 
 run_as_pg() {

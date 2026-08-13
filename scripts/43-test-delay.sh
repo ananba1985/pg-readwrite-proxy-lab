@@ -12,9 +12,9 @@ load_secrets
 psql_bin="${PG_CLIENT_PREFIX}/bin/psql"
 [[ -x "${psql_bin}" ]] || die '找不到 Pgpool 节点 psql。'
 
-root_ssh_port="${ROOT_SSH_PORT:-22}"
+# 该独立维护脚本使用 cluster.env 中与安装器相同的共用 SSH 端口。
 remote_standby_admin() {
-  ssh -p "${root_ssh_port}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@"${STANDBY_HOST}" \
+  ssh -p "${SSH_PORT}" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@"${STANDBY_HOST}" \
     "cd /tmp && ${STANDBY_ADMIN_TOOL} psql -d postgres -p ${STANDBY_PORT} -c \"$1\""
 }
 

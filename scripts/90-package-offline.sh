@@ -24,7 +24,7 @@ project_files=(
   scripts/30-install-pgpool.sh scripts/31-configure-pgpool.sh
   scripts/40-verify-cluster.sh scripts/41-observe-cluster.sh scripts/42-verify-external-entry.sh
   scripts/43-test-delay.sh scripts/44-test-standby-health.sh scripts/50-reset-primary-test-data.sh
-  scripts/90-package-offline.sh scripts/lib/common.sh
+  scripts/90-package-offline.sh scripts/lib/common.sh scripts/lib/installer-inputs.sh
   scripts/sql/primary-test-data.sql scripts/sql/verify-primary-test-data.sql
   templates/pgpool.conf.tpl templates/pool_hba.conf.tpl templates/primary-pg_hba.entries.tpl
   templates/primary-postgresql.conf.tpl templates/standby-postgresql.conf.tpl
