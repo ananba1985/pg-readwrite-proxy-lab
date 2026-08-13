@@ -22,9 +22,9 @@ for prefix in "${PGPOOL_RUNTIME_PREFIX}" "${PG_CLIENT_PREFIX}" "${PGPOOL_INSTALL
       die "既有安装前缀不是安全目录，拒绝覆盖: ${prefix}"
   fi
 done
-tar -xzf "$(offline_file "${PGPOOL_RUNTIME_PAYLOAD_FILE}")" -C /opt
-tar -xzf "$(offline_file "${PG_CLIENT_PAYLOAD_FILE}")" -C /opt
-tar -xzf "$(offline_file "${PGPOOL_PAYLOAD_FILE}")" -C /opt
+tar -xmzf "$(offline_file "${PGPOOL_RUNTIME_PAYLOAD_FILE}")" -C /opt
+tar -xmzf "$(offline_file "${PG_CLIENT_PAYLOAD_FILE}")" -C /opt
+tar -xmzf "$(offline_file "${PGPOOL_PAYLOAD_FILE}")" -C /opt
 [[ -d "${PGPOOL_RUNTIME_PREFIX}/lib" && -f "${PGPOOL_RUNTIME_PREFIX}/BUILD-INFO.txt" ]] || die '麒麟私有运行库载荷解压不完整。'
 [[ -x "${PG_CLIENT_PREFIX}/bin/psql" && -f "${PG_CLIENT_PREFIX}/lib/libpq.so.5" ]] || die 'PostgreSQL 12.0 客户端载荷解压不完整。'
 [[ -x "${PGPOOL_INSTALL_PREFIX}/bin/pgpool" ]] || die 'Pgpool-II 载荷解压不完整。'

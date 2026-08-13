@@ -30,7 +30,7 @@
 
 ```bash
 sha256sum -c pg-readwrite-proxy-offline-<版本>-kylin-v10-aarch64.tar.gz.sha256
-tar -xzf pg-readwrite-proxy-offline-<版本>-kylin-v10-aarch64.tar.gz
+tar -xmzf pg-readwrite-proxy-offline-<版本>-kylin-v10-aarch64.tar.gz
 cd pg-readwrite-proxy-offline-<版本>-kylin-v10-aarch64
 sudo bash install.sh
 ```
@@ -78,7 +78,7 @@ sudo bash install.sh \
 4. 确认后才备份并配置 Primary，初始化 Standby，安装/配置麒麟 Pgpool；
 5. 最终验证角色、`streaming`、节点识别、DML/SELECT 路由、事务写后读、监听范围，以及从 Primary 访问统一入口。
 
-检查阶段允许的唯一写入是 `/var/tmp` 下本次会话的 root-only 临时配置/随机凭据、离线载荷试解压目录、SSH `known_hosts` 和两台数据库节点的临时暂存；这些内容不会覆盖解压目录中的既有运行配置，不会改变数据库或系统服务，并会在检查失败或用户取消时清理。依赖、权限、路径、容量、网络、端口、载荷或数据库状态等技术门禁没有跳过选项。Primary/Standby 数据库客户端连接数是唯一具备人工例外菜单的运行状态：只有用户明确确认停写并接受会话中断后才允许非零继续；既有 Pgpool 的外部前端连接仍必须先清空。输入 `APPLY` 后，已有 Pgpool 场景还会在停止服务前再次复核前端连接；Primary 与 Standby 各自在实际改动前做最后一次本机连接统计，未授权时非零即失败，已授权时记录数量并由 fast stop 中断。
+检查阶段允许的唯一写入是 `/var/tmp` 下本次会话的 root-only 临时配置/随机凭据、离线载荷试解压目录、SSH `known_hosts` 和两台数据库节点的临时暂存；这些内容不会覆盖解压目录中的既有运行配置，不会改变数据库或系统服务，并会在检查失败或用户取消时清理。远端暂存解压不保留源文件修改时间，因此节点间 1 秒级时钟偏差不会触发 `tar` 失败；SSH 平台检查通过 Unix 时间估算显式允许 `5` 秒偏差，超过门禁才要求先同步系统时间。依赖、权限、路径、容量、网络、端口、载荷或数据库状态等技术门禁没有跳过选项。Primary/Standby 数据库客户端连接数是唯一具备人工例外菜单的运行状态：只有用户明确确认停写并接受会话中断后才允许非零继续；既有 Pgpool 的外部前端连接仍必须先清空。输入 `APPLY` 后，已有 Pgpool 场景还会在停止服务前再次复核前端连接；Primary 与 Standby 各自在实际改动前做最后一次本机连接统计，未授权时非零即失败，已授权时记录数量并由 fast stop 中断。
 
 幂等更新检测到本项目 Pgpool 正在运行时，会通过 `SHOW POOL_POOLS` 确认除本次只读检查外没有前端连接，并把当前连接池的后端 PID 精确传给 Primary/Standby 核验。这样只豁免本次已证明属于 Pgpool 的空闲后端，来源 IP 相同的直连客户端仍会失败关闭。如果更新在重新配置 Pgpool 前中断，退出清理会尝试恢复既有 Pgpool 服务。
 
@@ -116,7 +116,7 @@ sudo bash packages/build-kylin-v10-payloads.sh
 sudo bash scripts/90-package-offline.sh <版本>
 ```
 
-打包器只按 SHA 清单复制载荷，不会带入本地旧包、NebulaCM 厂商介质、PG_Safe_tool、授权文件或虚拟机文件。
+打包器只按 SHA 清单复制载荷，不会带入本地旧包、NebulaCM 厂商介质、PG_Safe_tool、授权文件或虚拟机文件。最终归档成员使用固定历史修改时间，首次解压不依赖构建机与隔离区服务器的时钟同步；交付身份以版本文件名和外置 SHA256 为准。
 
 ## 运维与验证入口
 

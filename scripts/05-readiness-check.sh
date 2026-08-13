@@ -346,7 +346,7 @@ case "${ROLE}" in
       gzip -t "${payload_path}" || die "离线载荷 gzip 结构损坏: ${payload_name}"
       unsafe_member="$(tar -tzf "${payload_path}" | awk '$0 ~ /^\// || $0 ~ /(^|\/)\.\.($|\/)/ {print; exit}')"
       [[ -z "${unsafe_member}" ]] || die "离线载荷包含不安全路径: ${payload_name}: ${unsafe_member}"
-      tar -xzf "${payload_path}" -C "${payload_test_root}"
+      tar -xmzf "${payload_path}" -C "${payload_test_root}"
     done
     test_runtime="${payload_test_root}/pgpool-runtime-kylin-v10/lib"
     test_client="${payload_test_root}/pgpool-client-12.0"

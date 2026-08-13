@@ -12,6 +12,17 @@ STATE_DIR='/var/lib/pg-rw-proxy-installer'
 log() { printf '[INSTALL] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 die() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+INSTALL_PHASE='启动参数与本机环境检查'
+
+report_unexpected_error() {
+  local exit_code="$?" line_number="${BASH_LINENO[0]:-unknown}"
+  ((BASH_SUBSHELL == 0)) || return "${exit_code}"
+  trap - ERR
+  printf '[ERROR] 安装器在阶段“%s”异常退出（退出码=%s，install.sh 行=%s）。请保留该行及其前面的错误信息。\n' \
+    "${INSTALL_PHASE}" "${exit_code}" "${line_number}" >&2
+  return "${exit_code}"
+}
+trap report_unexpected_error ERR
 
 # shellcheck source=scripts/lib/installer-inputs.sh
 source "${ROOT_DIR}/scripts/lib/installer-inputs.sh"
@@ -19,7 +30,7 @@ initialize_install_inputs
 parse_install_inputs "$@"
 
 [[ "${EUID}" -eq 0 ]] || die '请在 Pgpool-II 服务器上使用 root 运行 bash install.sh。'
-for command_name in ssh tar openssl awk sed sha256sum mktemp getenforce getconf uname id stat df; do
+for command_name in ssh tar openssl awk sed sha256sum mktemp getenforce getconf uname id stat df date; do
   command -v "${command_name}" >/dev/null 2>&1 || die "缺少系统基础命令: ${command_name}"
 done
 [[ -r /etc/os-release ]] || die '无法读取 /etc/os-release。'
@@ -188,7 +199,7 @@ export CLUSTER_CONFIG="${cluster_file}" SECRETS_CONFIG="${secrets_file}" POOL_US
 
 # 在本项目私有临时目录使用 sshpass，不写入 /usr/local。
 sshpass_root="$(mktemp -d /var/tmp/pg-rw-sshpass.XXXXXX)"
-tar -xzf "${PAYLOAD_DIR}/sshpass-1.10-aarch64-kylin-v10.tar.gz" -C "${sshpass_root}"
+tar -xmzf "${PAYLOAD_DIR}/sshpass-1.10-aarch64-kylin-v10.tar.gz" -C "${sshpass_root}"
 SSHPASS_BIN="${sshpass_root}/usr/local/bin/sshpass"
 [[ -x "${SSHPASS_BIN}" ]] || die 'sshpass 离线载荷解压失败。'
 export SSHPASS="${ROOT_SSH_PASSWORD}"
@@ -207,10 +218,13 @@ remote_command() { local host="$1" command_text="$2"; printf '%s\n' "${command_t
 stage_id="$(date '+%Y%m%d%H%M%S')-$$"
 primary_stage="/var/tmp/pg-rw-proxy-installer-${stage_id}-primary"
 standby_stage="/var/tmp/pg-rw-proxy-installer-${stage_id}-standby"
+CLOCK_SKEW_TOLERANCE_SECONDS=5
 
-for host in "${PRIMARY_HOST}" "${STANDBY_HOST}"; do
+check_remote_platform_and_clock() {
+  local host="$1" local_before local_after remote_epoch estimated_skew=0
   log "校验 root SSH 和目标平台：${host}:${SSH_PORT}"
-  remote_root "${host}" <<'REMOTE_CHECK'
+  local_before="$(date +%s)"
+  if ! remote_epoch="$(remote_root "${host}" <<'REMOTE_CHECK'
 set -e
 test "$(id -u)" -eq 0
 test "$(uname -m)" = aarch64
@@ -218,28 +232,54 @@ test -r /etc/os-release
 . /etc/os-release
 test "${ID:-}" = kylin
 test "${VERSION_ID:-}" = V10
+date +%s
 REMOTE_CHECK
+)"; then
+    die "${host}:${SSH_PORT} 的 root SSH、麒麟 V10 ARM64 平台或远端 date 检查失败。"
+  fi
+  local_after="$(date +%s)"
+  [[ "${remote_epoch}" =~ ^[0-9]+$ ]] || die "${host} 返回的系统时间无效。"
+  if ((remote_epoch < local_before)); then
+    estimated_skew=$((local_before - remote_epoch))
+  elif ((remote_epoch > local_after)); then
+    estimated_skew=$((remote_epoch - local_after))
+  fi
+  ((estimated_skew <= CLOCK_SKEW_TOLERANCE_SECONDS)) || \
+    die "${host} 与 Pgpool 节点的估算时钟偏差至少为 ${estimated_skew} 秒，超过 ${CLOCK_SKEW_TOLERANCE_SECONDS} 秒门禁；请先同步系统时间。"
+  log "${host} 时钟检查通过：估算偏差不超过 ${CLOCK_SKEW_TOLERANCE_SECONDS} 秒（秒级偏差允许）。"
+}
+
+for host in "${PRIMARY_HOST}" "${STANDBY_HOST}"; do
+  check_remote_platform_and_clock "${host}"
 done
 
 log '输入信息已收集完毕；从此处开始只执行临时暂存和只读检查，确认 APPLY 前不修改数据库、服务、账号、防火墙或持久配置。'
 
 copy_stage() {
   local host="$1" remote_dir="$2"
-  tar --exclude='./.git' --exclude='./vm' --exclude='./packages/sources' --exclude='./packages/payload' --exclude='./packages/dist' \
-    --exclude='./config/cluster.env' --exclude='./config/secrets.env' --exclude='./config/pool-users.txt' \
-    --exclude='./NebulaCM_Dbn_PostgreSQL-install-runtime-12.0-ky10-aarch64-20241212.tar.gz' \
-    --exclude='./PG_Safe_tool.tar.gz' --exclude='./gen_license-arm64' --exclude='./artifacts' \
-    -C "${ROOT_DIR}" -czf - . | \
-    "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"${host}" \
-      "mkdir -p '${remote_dir}' && tar -xzf - -C '${remote_dir}' && chmod +x '${remote_dir}'/scripts/*.sh '${remote_dir}'/scripts/lib/*.sh"
-  tar -C "${session_config_dir}" -czf - cluster.env secrets.env pool-users.txt | \
-    "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"${host}" \
-      "mkdir -p '${remote_dir}/session-config' && tar -xzf - -C '${remote_dir}/session-config' && chmod 600 '${remote_dir}'/session-config/*"
+  # 远端目录只是本次安装的临时副本，不依赖源文件 mtime。解压时使用 -m，避免节点间
+  # 秒级时钟偏差被 GNU tar 作为“时间戳在未来”警告并返回非零状态。
+  if ! tar --exclude='./.git' --exclude='./vm' --exclude='./packages/sources' --exclude='./packages/payload' --exclude='./packages/dist' \
+      --exclude='./config/cluster.env' --exclude='./config/secrets.env' --exclude='./config/pool-users.txt' \
+      --exclude='./NebulaCM_Dbn_PostgreSQL-install-runtime-12.0-ky10-aarch64-20241212.tar.gz' \
+      --exclude='./PG_Safe_tool.tar.gz' --exclude='./gen_license-arm64' --exclude='./artifacts' \
+      -C "${ROOT_DIR}" -czf - . | \
+      "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"${host}" \
+        "mkdir -p '${remote_dir}' && tar -xmzf - -C '${remote_dir}' && chmod +x '${remote_dir}'/scripts/*.sh '${remote_dir}'/scripts/lib/*.sh"; then
+    die "向 ${host} 暂存安装脚本失败；尚未修改数据库或持久配置。"
+  fi
+  if ! tar -C "${session_config_dir}" -czf - cluster.env secrets.env pool-users.txt | \
+      "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"${host}" \
+        "mkdir -p '${remote_dir}/session-config' && tar -xmzf - -C '${remote_dir}/session-config' && chmod 600 '${remote_dir}'/session-config/*"; then
+    die "向 ${host} 暂存会话配置失败；尚未修改数据库或持久配置。"
+  fi
 }
+INSTALL_PHASE='向 Primary 和 Standby 暂存安装脚本与会话配置'
 copy_stage "${PRIMARY_HOST}" "${primary_stage}"
 copy_stage "${STANDBY_HOST}" "${standby_stage}"
 
 # 在所有严格检查前冻结脚本会修改的持久状态；检查完成后必须逐字相同。
+INSTALL_PHASE='生成三节点部署前状态指纹'
 remote_env="CLUSTER_CONFIG='./session-config/cluster.env' SECRETS_CONFIG='./session-config/secrets.env' POOL_USERS_FILE='./session-config/pool-users.txt'"
 primary_baseline="$(remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; ${remote_env} ./scripts/06-state-fingerprint.sh primary")"
 standby_baseline="$(remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; ${remote_env} ./scripts/06-state-fingerprint.sh standby")"
@@ -247,11 +287,13 @@ pgpool_baseline="$("${ROOT_DIR}/scripts/06-state-fingerprint.sh" pgpool)"
 pgpool_was_active=no
 [[ "${pgpool_baseline}" == pgpool\|service=active\|* ]] && pgpool_was_active=yes
 
+INSTALL_PHASE='执行三节点基础只读预检'
 log '执行三节点基础只读预检。'
 remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; ${remote_env} ./scripts/00-preflight.sh primary"
 remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; ${remote_env} ./scripts/00-preflight.sh standby"
 "${ROOT_DIR}/scripts/00-preflight.sh" pgpool
 
+INSTALL_PHASE='执行 Pgpool、Primary 与 Standby 严格只读就绪检查'
 log '执行部署前严格就绪检查；此阶段不修改数据库、服务、配置、账号或防火墙。'
 pgpool_ready="$("${ROOT_DIR}/scripts/05-readiness-check.sh" pgpool)"
 printf '%s\n' "${pgpool_ready}"
@@ -313,9 +355,11 @@ cat <<SUMMARY
 
 基线不执行自动提升，也没有 failover/follow-primary 提升命令。
 SUMMARY
+INSTALL_PHASE='等待最终部署授权'
 read -r -p '确认维护窗口和上述变更。输入 APPLY 开始部署: ' confirmation
 [[ "${confirmation}" == 'APPLY' ]] || die '用户取消；所有服务器均未执行部署变更。'
 deployment_started=yes
+INSTALL_PHASE='APPLY 后最终连接复核'
 if [[ "${pgpool_was_active}" == yes ]]; then
   restart_existing_pgpool_on_error=yes
   # 用户确认后首先再次确认没有新客户端连入；失败仍处于零持久变更状态。
@@ -355,14 +399,18 @@ for config_name in cluster.env secrets.env pool-users.txt; do
   install -o root -g root -m 600 "${session_config_dir}/${config_name}" "${CONFIG_DIR}/${config_name}"
 done
 
+INSTALL_PHASE='备份并配置 Primary'
 log '1/4 备份并配置 Primary。'
 remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; FORCE_DB_RESTART_WITH_CLIENTS='${FORCE_DB_RESTART_WITH_CLIENTS}' ${remote_env} ./scripts/10-configure-primary.sh"
+INSTALL_PHASE='校验并初始化 Standby'
 log '2/4 校验既有 NebulaCM 运行时并初始化 Standby。'
 remote_command "${STANDBY_HOST}" "cd '${standby_stage}'; ${remote_env} ./scripts/20-install-postgresql-standby.sh; FORCE_DB_RESTART_WITH_CLIENTS='${FORCE_DB_RESTART_WITH_CLIENTS}' ${remote_env} ./scripts/21-bootstrap-standby.sh"
+INSTALL_PHASE='安装并配置 Pgpool-II'
 log '3/4 离线安装并配置 Pgpool-II。'
 "${ROOT_DIR}/scripts/30-install-pgpool.sh"
 "${ROOT_DIR}/scripts/31-configure-pgpool.sh"
 restart_existing_pgpool_on_error=no
+INSTALL_PHASE='验证复制、SQL 路由和统一入口'
 log '4/4 验证复制、SQL 路由和远端客户端入口。'
 "${ROOT_DIR}/scripts/40-verify-cluster.sh"
 remote_command "${PRIMARY_HOST}" "cd '${primary_stage}'; ${remote_env} ./scripts/42-verify-external-entry.sh"
