@@ -64,5 +64,5 @@
 - 不得用软链接伪造 OpenSSL/readline/libnsl ABI，也不得把 CentOS 系统库直接复制到麒麟。重新构建必须使用 `packages/build-kylin-v10-payloads.sh` 并更新 SHA 清单。
 - 客户端 CIDR 必须最小化；PCP 只监听 localhost；后端 5432 只允许 Standby 和 Pgpool 地址。
 - 当前实验入口未启用 TLS。跨不可信网络生产使用前必须部署服务端证书、客户端验证和密钥轮换。
-- `config/secrets.env` 与业务明文密码只应短暂存在于安装主机，完成 `pool_passwd` 生成后迁移到密钥系统并按制度擦除。
+- `install.sh` 首次部署可将 `config/secrets.env` 迁移到密钥系统后擦除；`repair.sh` 不依赖该文件，会在每次获批修复时以本次参数临时生成并轮换安装器受管凭据，退出后清理。业务密码仍只来自本次参数。
 - 一键安装首次连接使用隔离管理网中的 root 密码 SSH；生产应预置并核验 SSH 主机密钥，优先改为短期安装密钥或堡垒机审计，避免只依赖首次连接信任。

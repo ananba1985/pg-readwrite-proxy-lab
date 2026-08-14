@@ -16,8 +16,6 @@ done
 assert_safe_pgdata "${STANDBY_PGDATA}"
 verify_nebula_runtime "${STANDBY_PG_BIN_DIR}" "${STANDBY_ADMIN_TOOL}" 'Standby 续启节点'
 
-state_file='/var/lib/pg-rw-proxy-installer/standby-bootstrap.state'
-validate_standby_resume_state || die "缺少有效 Standby 中断状态: ${state_file}"
 [[ -f "${STANDBY_PGDATA}/PG_VERSION" && "$(tr -d '\r\n' <"${STANDBY_PGDATA}/PG_VERSION")" == '12' ]] || \
   die 'Standby PG_VERSION 缺失或版本不等于 12。'
 for file in postgresql.conf postgresql.auto.conf pg_hba.conf standby.signal global/pg_control; do
@@ -27,18 +25,17 @@ done
 [[ "$(stat -c '%U:%G:%a' "${STANDBY_PGDATA}")" == "${PG_OS_USER}:${PG_OS_USER}:700" ]] || \
   die "Standby PGDATA 所有者或权限异常: $(stat -c '%U:%G:%a' "${STANDBY_PGDATA}")"
 
-if grep -Fxq 'basebackup_complete=yes' "${state_file}"; then
-  resume_evidence='state_marker'
-elif grep -Fqx '# BEGIN PG_RW_PROXY_RECOVERY' "${STANDBY_PGDATA}/postgresql.auto.conf" && \
-     grep -Fqx '# END PG_RW_PROXY_RECOVERY' "${STANDBY_PGDATA}/postgresql.auto.conf" && \
-     grep -Fqx '# BEGIN PG_RW_PROXY_INCLUDE' "${STANDBY_PGDATA}/postgresql.conf" && \
-     grep -Fqx '# END PG_RW_PROXY_INCLUDE' "${STANDBY_PGDATA}/postgresql.conf" && \
-     grep -Fq "cluster_name = 'rw-standby'" "${STANDBY_PGDATA}/conf.d/99-pg-rw-proxy.conf"; then
-  # 兼容 2026-08-13 旧安装器：standby.signal 只在 pg_basebackup 返回 0 后创建，
-  # 上述受管配置随后写入，最后才调用 pg_ctl。因此它们共同证明基础备份已完成。
-  resume_evidence='legacy_post_basebackup_managed_config'
+if grep -Fqx '# BEGIN PG_RW_PROXY_RECOVERY' "${STANDBY_PGDATA}/postgresql.auto.conf" && \
+   grep -Fqx '# END PG_RW_PROXY_RECOVERY' "${STANDBY_PGDATA}/postgresql.auto.conf" && \
+   grep -Fqx '# BEGIN PG_RW_PROXY_INCLUDE' "${STANDBY_PGDATA}/postgresql.conf" && \
+   grep -Fqx '# END PG_RW_PROXY_INCLUDE' "${STANDBY_PGDATA}/postgresql.conf" && \
+   [[ -f "${STANDBY_PGDATA}/conf.d/99-pg-rw-proxy.conf" && ! -L "${STANDBY_PGDATA}/conf.d/99-pg-rw-proxy.conf" ]] && \
+   grep -Fq "cluster_name = 'rw-standby'" "${STANDBY_PGDATA}/conf.d/99-pg-rw-proxy.conf"; then
+  # standby.signal 仅在 pg_basebackup 返回 0 后创建，受管恢复配置随后写入；这些实时 PGDATA
+  # 证据与 pg_control/Primary system identifier 共同证明当前基础备份可续启，无需安装状态文件。
+  resume_evidence='live_pgdata_managed_recovery'
 else
-  die '没有基础备份完成标记或旧安装器的完整受管配置证据；拒绝猜测 PGDATA 是否完整。'
+  die '当前 PGDATA 缺少完整受管恢复配置证据；拒绝猜测基础备份是否完整。'
 fi
 
 export PGPASSWORD="${REPLICATION_PASSWORD}"
@@ -49,9 +46,6 @@ unset PGPASSWORD
 IFS='|' read -r primary_recovery expected_primary_system_id <<<"${primary_identity}"
 [[ "${primary_recovery}" == f && "${expected_primary_system_id}" =~ ^[0-9]+$ ]] || \
   die "无法确认当前 Primary 身份: ${primary_identity:-empty}"
-recorded_primary_system_id="$(sed -n 's/^primary_system_id=//p' "${state_file}" | tail -n 1)"
-[[ -z "${recorded_primary_system_id}" || "${recorded_primary_system_id}" == "${expected_primary_system_id}" ]] || \
-  die "恢复状态记录的 Primary=${recorded_primary_system_id} 与当前 Primary=${expected_primary_system_id} 不一致。"
 control_system_id="$(run_as_pg "${STANDBY_PG_BIN_DIR}" "${STANDBY_PG_BIN_DIR}/pg_controldata" "${STANDBY_PGDATA}" |
   awk -F: '/Database system identifier/{gsub(/[[:space:]]/,"",$2);print $2}')"
 [[ "${control_system_id}" == "${expected_primary_system_id}" ]] || \
@@ -80,6 +74,5 @@ done
 [[ "${standby}" == "120000|rw-standby|t|${expected_primary_system_id}|streaming" ]] || \
   die "Standby 已可连接但在 300 秒内未达到预期 streaming 恢复态: ${standby}"
 
-rm -f -- "${state_file}"
 printf 'STANDBY_RESUME_RESULT=READY action=start_or_wait_existing_pgdata basebackup=not_run evidence=%s state=%s\n' \
   "${resume_evidence}" "${standby}"
