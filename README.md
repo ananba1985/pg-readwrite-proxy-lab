@@ -86,7 +86,7 @@ sudo bash install.sh \
 
 如果完整安装已经进入大体量 `pg_basebackup`，不要中断同步，也不要为了更新校验脚本重新执行全量初始化。归档根目录中与 `install.sh` 并列的 `repair.sh` 接受完全相同的启动参数；缺项才交互补全。应在原安装进程退出后执行，也可以在同步期间先运行一次确认状态：检测到 `install.sh`、`21-bootstrap-standby.sh` 或 `pg_basebackup` 仍在运行时，它只记录日志并返回 `REPAIR_RESULT=WAITING_FOR_CURRENT_INSTALL_OR_BASEBACKUP`，不停止任何进程。
 
-若日志已经出现 `pg_basebackup: base backup completed`，但随后 `pg_ctl: server did not start in time`，不要重跑 `install.sh`。这表示基础备份已经完成，失败点是 Standby 首次恢复的启动等待窗口。`repair.sh` 会先只读校验恢复状态文件、`standby.signal`、受管配置、`PG_VERSION`、`pg_control` 和 Primary system identifier；证据全部一致后，用户输入 `REPAIR` 才会启动或继续等待当前 Standby PGDATA，最长等待 1800 秒。该续启入口不包含 `pg_basebackup`，不移动 PGDATA，不停止 Primary/Standby；Standby 达到 `streaming` 后才继续安装 Pgpool。
+若日志已经出现 `pg_basebackup: base backup completed`，但随后 `pg_ctl: server did not start in time`，不要重跑 `install.sh`。这表示基础备份已经完成，失败点是 Standby 首次恢复的启动等待窗口。`repair.sh` 不依赖安装状态文件，只读校验当前 PGDATA 的 `standby.signal`、受管恢复配置、`PG_VERSION`、`pg_control` 和 Primary 实时 system identifier；证据全部一致后，用户输入 `REPAIR` 才会启动或继续等待当前 Standby PGDATA，最长等待 1800 秒。该续启入口不包含 `pg_basebackup`，不移动 PGDATA，不停止 Primary/Standby；Standby 达到 `streaming` 后才继续安装 Pgpool。
 
 全量参数示例：
 
@@ -105,15 +105,17 @@ sudo bash repair.sh \
   --business-password '现有业务用户密码'
 ```
 
-`repair.sh` 先把本次全部参数与原安装已保存的 `config/cluster.env`、`config/secrets.env` 逐项比对，再检测主从角色、system identifier、复制槽、WAL receiver、`streaming`、监控/业务凭据、路由探针、Pgpool 运行时、配置、服务、自启、监听和节点识别。`--allowed-client-cidrs` 在 repair 中只用于确认“正在修复原安装会话”，不再作为要落盘的访问白名单；实际白名单每次都由 Primary 动态读取。判定规则如下：
+`repair.sh` 是无状态入口，只使用本次命令行参数和三台服务器的实时状态。它不读取、不比对、也不要求上一次安装生成的 `config/cluster.env`、`config/secrets.env`、`config/pool-users.txt`；即使这些文件全部删除仍可修复。启动后在 `/var/tmp` 私有目录生成本次配置，退出时清理。`--allowed-client-cidrs` 只用于形成完整参数集；实际白名单每次都由 Primary 动态读取。
+
+只读检查阶段不写账号或服务。用户输入 `REPAIR` 后，脚本会重新生成并轮换安装器拥有的 `rw_replicator`、`pgpool_monitor`、PCP 与 Pgpool 加密密钥，更新 Standby 的 postgres 私有复制密码文件，再配置 Pgpool。它不会修改业务账号密码，不会停止或重启 Primary/Standby；已有 streaming 会话不会因角色改密被主动断开。随后继续检测主从角色、system identifier、复制槽、WAL receiver、`streaming`、业务凭据、路由探针、Pgpool 运行时、配置、服务、自启、监听和节点识别。判定规则如下：
 
 - 完整安装或基础同步仍运行：只报告 `WAITING`，退出码 `10`；
 - 主从不同源或 Standby 既不可用又缺少完整基础备份证据：报告 `BLOCKED_DATABASE`，退出码 `20`，不修改数据库；已证明基础备份完成的启动中断会列出 `standby_resume_existing_pgdata`，输入 `REPAIR` 后只续启现有 PGDATA；
 - Primary HBA 无法稳定读取、存在解析错误，或没有可同步的普通 IPv4 `host` 白名单：报告 `BLOCKED_PRIMARY_POLICY`，退出码 `25`，不修改任何节点；
-- Pgpool 本机有可修复项：逐项列出，只有用户输入 `REPAIR` 后才执行本机离线运行时、配置和 systemd 服务修复；其他输入返回退出码 `30`；
-- 所有检查通过：报告 `REPAIR_RESULT=HEALTHY`；修复并验收通过则报告 `REPAIR_RESULT=REPAIRED`。
+- 脚本逐项列出受管凭据、Standby 续启（如需要）和 Pgpool 本机可修复项；只有用户输入 `REPAIR` 后才执行，其他输入返回退出码 `30`；
+- 只读检查通过后始终列出本次受管凭据轮换与会话配置重建项；只有用户输入 `REPAIR` 才会执行，验收通过后报告 `REPAIR_RESULT=REPAIRED`。
 
-该入口源码和回归门禁禁止调用 `10-configure-primary.sh`、`20-install-postgresql-standby.sh`、`21-bootstrap-standby.sh`，并禁止执行 `pg_basebackup` 或停止数据库。唯一允许的数据库动作是调用 `22-resume-standby-after-basebackup.sh` 启动/等待已经完成基础备份的 Standby PGDATA；其他修复只调用 Pgpool 本机的 `30-install-pgpool.sh`、`31-configure-pgpool.sh`。随后通过专用 `business.rw_probe` 做少量可自动清理的 DML/SELECT 路由验收。完整日志写入 `/var/log/pg-readwrite-proxy-lab/repair-<时间>-<PID>.log`，目录 700、文件 600。
+该入口源码和回归门禁禁止调用 `10-configure-primary.sh`、`20-install-postgresql-standby.sh`、`21-bootstrap-standby.sh`，并禁止执行 `pg_basebackup` 或停止数据库。允许的数据库动作只有：轮换两个安装器受管角色密码、更新 Standby 私有复制密码文件，以及在证据链完整时调用 `22-resume-standby-after-basebackup.sh` 启动/等待已完成基础备份的 Standby PGDATA；其他修复只调用 Pgpool 本机的 `30-install-pgpool.sh`、`31-configure-pgpool.sh`。随后通过专用 `business.rw_probe` 做少量可自动清理的 DML/SELECT 路由验收。完整日志写入 `/var/log/pg-readwrite-proxy-lab/repair-<时间>-<PID>.log`，目录 700、文件 600。
 
 ### repair 同步 Primary 访问策略
 
@@ -122,6 +124,32 @@ Primary 是业务客户端 IP 白名单的来源。`repair.sh` 使用厂商超�
 以下内容不会成为客户端白名单：本项目 `# BEGIN/END PG_RW_PROXY_HBA` 区块中的 Standby 复制、监控、Pgpool 到后端通道，以及本机回环规则。`repair.sh` 不会把 Primary HBA 写到 Standby，也不会修改或 reload Primary；Streaming Replication 本身也不会持续复制 HBA 配置文件。
 
 这项同步只复制“允许访问的 IPv4 地址集合”，不复制 Primary 规则中的数据库名、用户名、先后顺序或认证细节。回环地址、`0.0.0.0/0`、IPv6、hostname、`reject`、`hostssl` 等非普通规则直接忽略；Pgpool 仍通过自己的 `pool_passwd` 校验实际登录账号。该行为有意保持简单，适用于现场现有的普通 IPv4 白名单。
+
+## 开放实例内全部数据库和现有登录用户
+
+初始安装按一个 `BUSINESS_DATABASE + BUSINESS_USER` 完成读写路由验收。若现场需要让同一 PostgreSQL 实例内的其他现有登录用户也通过 Pgpool 访问其有权连接的数据库，在 Pgpool 服务器上运行归档顶层脚本：
+
+```bash
+sudo bash enable-all-databases-users.sh \
+  --pgpool-host 192.168.80.140 \
+  --primary-host 192.168.80.110 \
+  --standby-host 192.168.80.120 \
+  --postgresql-port 5432 \
+  --pgpool-port 5432 \
+  --ssh-port 22022 \
+  --root-ssh-password '数据库服务器root密码'
+```
+
+参数未提供时会在启动阶段交互补全。脚本先完成平台、三节点身份、system identifier、`streaming`、配置路径、HBA 语法、网络、监听、文件权限和备份能力检查，展示完整计划后仅在输入 `APPLY` 时执行。它会：
+
+- 保留 Pgpool 当前 `pool_hba.conf` 的客户端来源 IP/CIDR，只把前端认证从 `md5` 改为 `password`，从而不再要求把每个业务用户密码登记到 `pool_passwd`；
+- 在 Primary 和 Standby 的实际 `pg_hba.conf` 顶部增加独立受管区块，仅允许 Pgpool 服务器的 `/32` 地址以 `all database + all user` 进入后端；
+- 分别备份三台服务器的原配置，reload PostgreSQL 与 Pgpool 后校验解析状态；任一步失败则尝试恢复本次备份；
+- 不创建、启用、提权或改密任何 PostgreSQL 角色，不修改数据库 `CONNECT` 或对象权限，不重启服务，不执行 `pg_basebackup`，也不重新同步 Standby。
+
+这里的“全部用户”指 PostgreSQL 中已经存在且具备 `LOGIN` 的角色；实际访问能力仍由角色的数据库 `CONNECT`、schema/table 等原有权限决定。Pgpool 仍只接受当前 `pool_hba.conf` 已允许的客户端来源。当前基线 `ssl=off`，而 `password` 前端认证会在客户端到 Pgpool 链路上传输明文口令协议；脚本会明确警告，仅适用于已确认的物理隔离受控网络，生产长期方案应启用 TLS。
+
+该脚本是安装后的独立扩展。当前 `repair.sh` 仍会按单业务用户基线重新生成 Pgpool 认证文件；若之后执行了 `repair.sh`，需再次运行 `enable-all-databases-users.sh`。脚本日志写入 `/var/log/pg-readwrite-proxy-lab/enable-all-databases-users-<时间>-<PID>.log`。
 
 ## 安全与回滚
 

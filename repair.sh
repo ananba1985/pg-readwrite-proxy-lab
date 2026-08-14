@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 
-# 与 install.sh 并列的中断续装入口。通常只修复 Pgpool；唯一数据库写操作是：
-# 在严格证明 pg_basebackup 已完成后，启动/等待现有 Standby PGDATA，绝不重新同步。
+# 与 install.sh 并列的无状态中断续装入口。只依赖本次参数和三节点实时状态；
+# REPAIR 后可轮换安装器受管凭据，并在严格证明 pg_basebackup 已完成后续启现有 Standby。
 set -Eeuo pipefail
 IFS=$'\n\t'
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG_DIR="${ROOT_DIR}/config"
 INSTALL_PHASE='启动参数与本机环境检查'
 TEMP_ROOT=''
+session_config_dir=''
 SSHPASS_BIN=''
 CHECK_PSQL=''
 CHECK_LD_LIBRARY_PATH=''
@@ -27,8 +27,29 @@ die() {
 }
 
 cleanup() {
+  local pair host remote_stage
+  if declare -F remote_root >/dev/null 2>&1; then
+    for pair in \
+      "${PRIMARY_HOST:-}|${primary_credential_stage:-}" \
+      "${STANDBY_HOST:-}|${standby_credential_stage:-}" \
+      "${STANDBY_HOST:-}|${standby_resume_stage:-}"; do
+      host="${pair%%|*}"; remote_stage="${pair#*|}"
+      if [[ -z "${host}" ]] || \
+         [[ "${remote_stage}" != /var/tmp/pg-rw-credential-repair-* && "${remote_stage}" != /var/tmp/pg-rw-standby-resume-* ]]; then
+        continue
+      fi
+      printf 'stage=%q\ncase "${stage}" in /var/tmp/pg-rw-credential-repair-*|/var/tmp/pg-rw-standby-resume-*) rm -rf -- "${stage}";; esac\n' \
+        "${remote_stage}" | remote_root "${host}" >/dev/null 2>&1 || true
+    done
+  fi
   if [[ -n "${TEMP_ROOT:-}" && "${TEMP_ROOT}" == /var/tmp/pg-rw-repair.* && -d "${TEMP_ROOT}" ]]; then
     rm -rf --one-file-system -- "${TEMP_ROOT}"
+  fi
+  if [[ -n "${session_config_dir:-}" && "${session_config_dir}" == /var/tmp/pg-rw-repair-config.* && -d "${session_config_dir}" ]]; then
+    if command -v shred >/dev/null 2>&1; then
+      find "${session_config_dir}" -type f -exec shred -u -- {} + 2>/dev/null || true
+    fi
+    rm -rf --one-file-system -- "${session_config_dir}"
   fi
   unset SSHPASS ROOT_SSH_PASSWORD REQUEST_BUSINESS_PASSWORD BUSINESS_PASSWORD
 }
@@ -53,15 +74,15 @@ trap cleanup EXIT INT TERM
 trap 'report_unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 INSTALLER_ENTRYPOINT_NAME='repair.sh'
-INSTALLER_FINAL_BEHAVIOR='脚本先执行只读状态检测；正在同步时只报告并退出。若基础备份已完成但 Standby 启动中断，REPAIR 只续启当前 PGDATA；其余修复仅限 Pgpool，绝不重新执行基础备份。'
-INSTALLER_ALLOWED_CLIENT_CIDRS_HELP='初次安装保存值，仅用于核对安装会话；实际规则从 Primary 动态读取'
+INSTALLER_FINAL_BEHAVIOR='脚本只使用本次参数和三台服务器实时状态；正在同步时只报告并退出。REPAIR 会轮换安装器受管凭据、续启已完成基础备份的 Standby（如需要）并修复 Pgpool，绝不重新执行基础备份。'
+INSTALLER_ALLOWED_CLIENT_CIDRS_HELP='本次完整参数；repair 实际规则从 Primary 动态读取'
 # shellcheck source=scripts/lib/installer-inputs.sh
 source "${ROOT_DIR}/scripts/lib/installer-inputs.sh"
 initialize_install_inputs
 parse_install_inputs "$@"
 
 [[ "${EUID}" -eq 0 ]] || die '请在 Pgpool-II 服务器上使用 root 运行 bash repair.sh。'
-for command_name in ssh tar awk sed sha256sum mktemp getenforce getconf uname id stat date tee ip pgrep timeout grep cmp ss systemctl readlink install find md5sum chown chmod journalctl cp rm touch; do
+for command_name in ssh scp tar openssl awk sed sha256sum mktemp getenforce getconf uname id stat date tee ip pgrep timeout grep cmp ss systemctl readlink install find md5sum chown chmod journalctl cp rm touch sleep; do
   command -v "${command_name}" >/dev/null 2>&1 || die "缺少系统基础命令: ${command_name}"
 done
 
@@ -108,7 +129,7 @@ validate_request_port() {
 }
 
 printf '\nPostgreSQL Streaming Replication + Pgpool-II 状态检测与中断续装\n'
-printf '本入口不会配置或重启 Primary，不会执行 pg_basebackup；必要时只续启已完成基础备份的 Standby PGDATA。\n\n'
+printf '本入口不依赖上一次安装文件，不重启 Primary/Standby，不执行 pg_basebackup；REPAIR 后只轮换安装器受管凭据并按需续启已完成基础备份的 Standby PGDATA。\n\n'
 prompt_default PGPOOL_HOST '当前 Pgpool-II 服务器内网 IPv4 地址' '192.168.80.140'
 prompt_default PRIMARY_HOST '现有 PostgreSQL Primary 内网 IPv4 地址' '192.168.80.110'
 prompt_default STANDBY_HOST 'PostgreSQL Standby 目标机内网 IPv4 地址' '192.168.80.120'
@@ -126,7 +147,7 @@ validate_request_port "${PRIMARY_PORT}"
 validate_request_port "${PGPOOL_PORT}"
 validate_request_port "${SSH_PORT}"
 [[ "${PGPOOL_PORT}" != '9898' ]] || die 'Pgpool 对外端口不能与本机 PCP 端口 9898 冲突。'
-prompt_default ALLOWED_CLIENT_CIDRS '初次安装保存的客户端 IPv4 CIDR（仅用于安装会话校验；repair 以 Primary 实际策略为准）' "${PGPOOL_HOST%.*}.0/24"
+prompt_default ALLOWED_CLIENT_CIDRS '客户端 IPv4 CIDR（repair 以 Primary 实际策略为准）' "${PGPOOL_HOST%.*}.0/24"
 IFS=',' read -r -a _allowed_cidrs <<<"${ALLOWED_CLIENT_CIDRS}"
 ((${#_allowed_cidrs[@]} > 0)) || die '客户端 CIDR 不能为空。'
 for cidr in "${_allowed_cidrs[@]}"; do
@@ -144,7 +165,7 @@ validate_request_identifier "${BUSINESS_DATABASE}"
 prompt_secret ROOT_SSH_PASSWORD 'Primary 与 Standby 的 root SSH 公共密码' allow
 prompt_secret BUSINESS_PASSWORD "现有数据库用户 ${BUSINESS_USER} 的密码"
 
-# 冻结本次输入；随后加载的已安装配置不得静默覆盖这些值。
+# 冻结本次输入。repair.sh 不读取、比对或依赖任何上一次安装生成的配置文件。
 REQUEST_PGPOOL_HOST="${PGPOOL_HOST}"
 REQUEST_PRIMARY_HOST="${PRIMARY_HOST}"
 REQUEST_STANDBY_HOST="${STANDBY_HOST}"
@@ -156,12 +177,66 @@ REQUEST_BUSINESS_USER="${BUSINESS_USER}"
 REQUEST_BUSINESS_DATABASE="${BUSINESS_DATABASE}"
 REQUEST_BUSINESS_PASSWORD="${BUSINESS_PASSWORD}"
 
-CLUSTER_CONFIG="${CONFIG_DIR}/cluster.env"
-SECRETS_CONFIG="${CONFIG_DIR}/secrets.env"
-POOL_USERS_FILE="${CONFIG_DIR}/pool-users.txt"
+umask 077
+write_env() { printf '%s=%q\n' "$2" "$3" >>"$1"; }
+random_secret() { openssl rand -hex 32; }
+
+session_config_dir="$(mktemp -d /var/tmp/pg-rw-repair-config.XXXXXX)"
+chmod 700 "${session_config_dir}"
+cluster_file="${session_config_dir}/cluster.env"
+secrets_file="${session_config_dir}/secrets.env"
+pool_users_file="${session_config_dir}/pool-users.txt"
+: >"${cluster_file}"
+
+declare -A values=(
+  [PG_MAJOR]='12' [PG_VERSION_FULL]='12.0' [DB_DISTRIBUTION]='NebulaCM'
+  [DBN_VERSION_MARKER]='NebulaCM_Dbn_PostgreSQL-install-runtime-12.0-ky10-aarch64-20241212.tar.gz'
+  [DB_POSTGRES_SHA256]='aecef1bcf6557271a4ffaf9b55eb53df81c883984e1489916c85e88677477bcf'
+  [DB_PG_BASEBACKUP_SHA256]='c235544bad0e0dc61b9c4fbc6becc7181970b9179b2aa071ff8a1821899815bb'
+  [DB_PG_CONFIG_SHA256]='90321c1cb01d583ffa55523fd54490f93b2cb17fbcbe5fd99319ef0812f224df'
+  [DB_TOOLS_SHA256]='1cfa544a74dc88f1bdc88db52fac5566b73eec4a0c3b15e33e60ec86a2cffa0f'
+  [PG_OS_USER]='postgres' [PGPOOL_MAJOR]='4.7' [PGPOOL_VERSION]='4.7.2'
+  [PGPOOL_INSTALL_PREFIX]='/opt/pgpool-II-4.7.2' [PG_CLIENT_PREFIX]='/opt/pgpool-client-12.0' [PGPOOL_RUNTIME_PREFIX]='/opt/pgpool-runtime-kylin-v10'
+  [OFFLINE_PACKAGE_DIR]='packages/payload'
+  [PGPOOL_PAYLOAD_FILE]='pgpool-II-4.7.2-pg12.0-aarch64-kylin-v10.tar.gz' [PGPOOL_PAYLOAD_SHA256]='b80c79b8e6537a14a6adc8ab4ae58baa40a2e027c8fc99a3589510462425dbea'
+  [PG_CLIENT_PAYLOAD_FILE]='postgresql-client-12.0-aarch64-kylin-v10.tar.gz' [PG_CLIENT_PAYLOAD_SHA256]='1314901d8b0de906fcc47c7784913fd347d07a3b563475f8eae4e16310ba8667'
+  [PGPOOL_RUNTIME_PAYLOAD_FILE]='pgpool-runtime-kylin-v10-aarch64.tar.gz' [PGPOOL_RUNTIME_PAYLOAD_SHA256]='6d00411d0098b2bab0c3f9e3a0d5d009907189eb2b0e3a743edd3063bce9a257'
+  [SSHPASS_PAYLOAD_FILE]='sshpass-1.10-aarch64-kylin-v10.tar.gz' [SSHPASS_PAYLOAD_SHA256]='84bcff17fc7e48d0a8552c985818e17e485f95a66b3c50c4eedde6bcbdc96ffd'
+  [SSH_PORT]="${REQUEST_SSH_PORT}"
+  [PRIMARY_HOST]="${REQUEST_PRIMARY_HOST}" [PRIMARY_PORT]="${REQUEST_PRIMARY_PORT}" [PRIMARY_PGDATA]='/pgsql/12/data'
+  [PRIMARY_PG_BIN_DIR]='/opt/pgsql12/bin' [PRIMARY_ADMIN_TOOL]='/opt/pgsql12/bin/tools' [PRIMARY_LISTEN_ADDRESSES]="127.0.0.1,${REQUEST_PRIMARY_HOST}"
+  [STANDBY_HOST]="${REQUEST_STANDBY_HOST}" [STANDBY_PORT]="${REQUEST_PRIMARY_PORT}" [STANDBY_PGDATA]='/pgsql/12/data'
+  [STANDBY_PG_BIN_DIR]='/opt/pgsql12/bin' [STANDBY_ADMIN_TOOL]='/opt/pgsql12/bin/tools' [STANDBY_LISTEN_ADDRESSES]="127.0.0.1,${REQUEST_STANDBY_HOST}"
+  [STANDBY_APPLICATION_NAME]='rw_standby' [REPLICATION_SLOT_NAME]='rw_standby_slot'
+  [PGPOOL_HOST]="${REQUEST_PGPOOL_HOST}" [PGPOOL_PORT]="${REQUEST_PGPOOL_PORT}" [PCP_PORT]='9898' [PGPOOL_SERVICE]='pgpool' [PGPOOL_CONFIG_DIR]='/etc/pgpool-II'
+  [STANDBY_ADDRESS_CIDR]="${REQUEST_STANDBY_HOST}/32" [PGPOOL_ADDRESS_CIDR]="${REQUEST_PGPOOL_HOST}/32"
+  [ALLOWED_CLIENT_CIDRS]="${REQUEST_ALLOWED_CLIENT_CIDRS}"
+  [REPLICATION_USER]='rw_replicator' [MONITOR_USER]='pgpool_monitor'
+  [BUSINESS_USER]="${REQUEST_BUSINESS_USER}" [BUSINESS_DATABASE]="${REQUEST_BUSINESS_DATABASE}" [PCP_USER]='pgpool_admin'
+  [MAX_WAL_SENDERS]='10' [MAX_REPLICATION_SLOTS]='10' [WAL_KEEP_SEGMENTS]='1000'
+  [PRIMARY_READ_WEIGHT]='0' [STANDBY_READ_WEIGHT]='1' [DISABLE_LOAD_BALANCE_ON_WRITE]='transaction'
+  [READ_LAG_THRESHOLD_SECONDS]='5' [SR_CHECK_PERIOD]='5' [HEALTH_CHECK_PERIOD]='5' [HEALTH_CHECK_TIMEOUT]='5'
+  [HEALTH_CHECK_MAX_RETRIES]='3' [HEALTH_CHECK_RETRY_DELAY]='1' [CONNECT_TIMEOUT_MS]='5000'
+  [NUM_INIT_CHILDREN]='8' [MAX_POOL]='2' [CONNECTION_LIFE_TIME]='600' [LOG_PER_NODE_STATEMENT]='on'
+  [APPLY_PRIMARY_RESTART]='no' [ALLOW_STANDBY_REINITIALIZE]='no'
+)
+order=(PG_MAJOR PG_VERSION_FULL DB_DISTRIBUTION DBN_VERSION_MARKER DB_POSTGRES_SHA256 DB_PG_BASEBACKUP_SHA256 DB_PG_CONFIG_SHA256 DB_TOOLS_SHA256 PG_OS_USER PGPOOL_MAJOR PGPOOL_VERSION PGPOOL_INSTALL_PREFIX PG_CLIENT_PREFIX PGPOOL_RUNTIME_PREFIX OFFLINE_PACKAGE_DIR PGPOOL_PAYLOAD_FILE PGPOOL_PAYLOAD_SHA256 PG_CLIENT_PAYLOAD_FILE PG_CLIENT_PAYLOAD_SHA256 PGPOOL_RUNTIME_PAYLOAD_FILE PGPOOL_RUNTIME_PAYLOAD_SHA256 SSHPASS_PAYLOAD_FILE SSHPASS_PAYLOAD_SHA256 SSH_PORT PRIMARY_HOST PRIMARY_PORT PRIMARY_PGDATA PRIMARY_PG_BIN_DIR PRIMARY_ADMIN_TOOL PRIMARY_LISTEN_ADDRESSES STANDBY_HOST STANDBY_PORT STANDBY_PGDATA STANDBY_PG_BIN_DIR STANDBY_ADMIN_TOOL STANDBY_LISTEN_ADDRESSES STANDBY_APPLICATION_NAME REPLICATION_SLOT_NAME PGPOOL_HOST PGPOOL_PORT PCP_PORT PGPOOL_SERVICE PGPOOL_CONFIG_DIR STANDBY_ADDRESS_CIDR PGPOOL_ADDRESS_CIDR ALLOWED_CLIENT_CIDRS REPLICATION_USER MONITOR_USER BUSINESS_USER BUSINESS_DATABASE PCP_USER MAX_WAL_SENDERS MAX_REPLICATION_SLOTS WAL_KEEP_SEGMENTS PRIMARY_READ_WEIGHT STANDBY_READ_WEIGHT DISABLE_LOAD_BALANCE_ON_WRITE READ_LAG_THRESHOLD_SECONDS SR_CHECK_PERIOD HEALTH_CHECK_PERIOD HEALTH_CHECK_TIMEOUT HEALTH_CHECK_MAX_RETRIES HEALTH_CHECK_RETRY_DELAY CONNECT_TIMEOUT_MS NUM_INIT_CHILDREN MAX_POOL CONNECTION_LIFE_TIME LOG_PER_NODE_STATEMENT APPLY_PRIMARY_RESTART ALLOW_STANDBY_REINITIALIZE)
+for name in "${order[@]}"; do write_env "${cluster_file}" "${name}" "${values[${name}]}"; done
+
+: >"${secrets_file}"
+write_env "${secrets_file}" REPLICATION_PASSWORD "$(random_secret)"
+write_env "${secrets_file}" MONITOR_PASSWORD "$(random_secret)"
+write_env "${secrets_file}" BUSINESS_PASSWORD "${REQUEST_BUSINESS_PASSWORD}"
+write_env "${secrets_file}" PCP_PASSWORD "$(random_secret)"
+write_env "${secrets_file}" PGPOOL_AES_KEY "$(random_secret)"
+: >"${pool_users_file}"
+chmod 600 "${cluster_file}" "${secrets_file}" "${pool_users_file}"
+
+CLUSTER_CONFIG="${cluster_file}"
+SECRETS_CONFIG="${secrets_file}"
+POOL_USERS_FILE="${pool_users_file}"
 export CLUSTER_CONFIG SECRETS_CONFIG POOL_USERS_FILE
-[[ -f "${CLUSTER_CONFIG}" && -f "${SECRETS_CONFIG}" && -f "${POOL_USERS_FILE}" ]] || \
-  die "缺少当前安装会话配置；必须保留 ${CONFIG_DIR}/cluster.env、secrets.env、pool-users.txt 才能在不重建 Standby 的前提下续装。" 20
+printf 'CHECK repair_session_config status=PASS source=current_command_only prior_install_files=ignored persistent_write=no old_config_dir_access=no\n'
 
 # shellcheck source=scripts/lib/common.sh
 source "${ROOT_DIR}/scripts/lib/common.sh"
@@ -185,24 +260,6 @@ trap 'report_unexpected_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 
 load_cluster_config
 load_secrets
-
-assert_input_matches() {
-  local name="$1" requested="$2" installed="$3"
-  [[ "${requested}" == "${installed}" ]] || \
-    die "本次参数 ${name} 与当前安装配置不一致：输入=${requested}，已安装=${installed}。为避免修错集群，拒绝继续。" 20
-}
-assert_input_matches PGPOOL_HOST "${REQUEST_PGPOOL_HOST}" "${PGPOOL_HOST}"
-assert_input_matches PRIMARY_HOST "${REQUEST_PRIMARY_HOST}" "${PRIMARY_HOST}"
-assert_input_matches STANDBY_HOST "${REQUEST_STANDBY_HOST}" "${STANDBY_HOST}"
-assert_input_matches POSTGRESQL_PORT "${REQUEST_PRIMARY_PORT}" "${PRIMARY_PORT}"
-assert_input_matches STANDBY_PORT "${REQUEST_PRIMARY_PORT}" "${STANDBY_PORT}"
-assert_input_matches PGPOOL_PORT "${REQUEST_PGPOOL_PORT}" "${PGPOOL_PORT}"
-assert_input_matches SSH_PORT "${REQUEST_SSH_PORT}" "${SSH_PORT}"
-assert_input_matches ALLOWED_CLIENT_CIDRS "${REQUEST_ALLOWED_CLIENT_CIDRS}" "${ALLOWED_CLIENT_CIDRS}"
-assert_input_matches BUSINESS_USER "${REQUEST_BUSINESS_USER}" "${BUSINESS_USER}"
-assert_input_matches BUSINESS_DATABASE "${REQUEST_BUSINESS_DATABASE}" "${BUSINESS_DATABASE}"
-[[ "${REQUEST_BUSINESS_PASSWORD}" == "${BUSINESS_PASSWORD}" ]] || \
-  die '本次 business password 与安装会话保存值不一致；拒绝用不一致的凭据重写 Pgpool。' 20
 
 local_addresses="$(ip -o -4 addr show | awk '{split($4,a,"/"); print a[1]}')"
 grep -Fxq "${PGPOOL_HOST}" <<<"${local_addresses}" || \
@@ -234,6 +291,10 @@ remote_root() {
   "${SSHPASS_BIN}" -e ssh "${ssh_args[@]}" root@"${host}" bash -s
 }
 
+primary_credential_stage="/var/tmp/pg-rw-credential-repair-$$-primary"
+standby_credential_stage="/var/tmp/pg-rw-credential-repair-$$-standby"
+standby_resume_stage="/var/tmp/pg-rw-standby-resume-$$"
+
 stage_standby_resume_script() {
   local remote_stage="/var/tmp/pg-rw-standby-resume-$$"
   local resume_files=(
@@ -252,7 +313,7 @@ stage_standby_resume_script() {
       root@"${STANDBY_HOST}":"${remote_stage}/${file}" >/dev/null
   done
   for file in cluster.env secrets.env pool-users.txt; do
-    "${SSHPASS_BIN}" -e scp "${scp_args[@]}" "${CONFIG_DIR}/${file}" \
+    "${SSHPASS_BIN}" -e scp "${scp_args[@]}" "${session_config_dir}/${file}" \
       root@"${STANDBY_HOST}":"${remote_stage}/session-config/${file}" >/dev/null
   done
   {
@@ -262,6 +323,62 @@ stage_standby_resume_script() {
     printf 'chmod 600 "${stage}/scripts/lib/common.sh" "${stage}/session-config/"*\n'
   } | remote_root "${STANDBY_HOST}"
   printf '%s' "${remote_stage}"
+}
+
+stage_managed_credential_script() {
+  local host="$1" role="$2" remote_stage
+  local script_file file
+  case "${role}" in
+    primary) script_file='scripts/11-rotate-managed-credentials.sh'; remote_stage="${primary_credential_stage}" ;;
+    standby) script_file='scripts/23-update-standby-replication-passfile.sh'; remote_stage="${standby_credential_stage}" ;;
+    *) die "未知凭据修复角色: ${role}" ;;
+  esac
+  {
+    printf 'set -Eeuo pipefail\n'
+    printf 'umask 077\n'
+    printf 'stage=%q\n' "${remote_stage}"
+    printf 'rm -rf -- "${stage}"\n'
+    printf 'install -d -o root -g root -m 700 "${stage}/scripts/lib" "${stage}/session-config"\n'
+  } | remote_root "${host}"
+  for file in "${script_file}" scripts/lib/common.sh; do
+    "${SSHPASS_BIN}" -e scp "${scp_args[@]}" "${ROOT_DIR}/${file}" \
+      root@"${host}":"${remote_stage}/${file}" >/dev/null
+  done
+  for file in cluster.env secrets.env pool-users.txt; do
+    "${SSHPASS_BIN}" -e scp "${scp_args[@]}" "${session_config_dir}/${file}" \
+      root@"${host}":"${remote_stage}/session-config/${file}" >/dev/null
+  done
+  {
+    printf 'set -Eeuo pipefail\n'
+    printf 'stage=%q\n' "${remote_stage}"
+    printf 'chmod 700 "${stage}/%s"\n' "${script_file}"
+    printf 'chmod 600 "${stage}/scripts/lib/common.sh" "${stage}/session-config/"*\n'
+  } | remote_root "${host}"
+  printf '%s' "${remote_stage}"
+}
+
+run_staged_managed_credential_script() {
+  local host="$1" role="$2" remote_stage script_file output status
+  case "${role}" in
+    primary) script_file='scripts/11-rotate-managed-credentials.sh' ;;
+    standby) script_file='scripts/23-update-standby-replication-passfile.sh' ;;
+    *) die "未知凭据修复角色: ${role}" ;;
+  esac
+  remote_stage="$(stage_managed_credential_script "${host}" "${role}")"
+  set +e
+  output="$({
+    printf 'cd %q\n' "${remote_stage}"
+    printf 'CLUSTER_CONFIG=%q SECRETS_CONFIG=%q POOL_USERS_FILE=%q ./%s\n' \
+      "${remote_stage}/session-config/cluster.env" \
+      "${remote_stage}/session-config/secrets.env" \
+      "${remote_stage}/session-config/pool-users.txt" "${script_file}"
+  } | remote_root "${host}" 2>&1)"
+  status=$?
+  set -e
+  printf 'stage=%q\ncase "${stage}" in /var/tmp/pg-rw-credential-repair-[0-9]*-*) rm -rf -- "${stage}";; esac\n' \
+    "${remote_stage}" | remote_root "${host}" >/dev/null 2>&1 || true
+  printf '%s\n' "${output}"
+  [[ "${status}" == 0 ]] || die "${role} 受管凭据修复失败（status=${status}）。" 21
 }
 
 cleanup_standby_resume_stage() {
@@ -278,25 +395,17 @@ standby_resume_candidate_snapshot() {
     printf 'PORT=%q\n' "${STANDBY_PORT}"
     cat <<'REMOTE'
 set -Eeuo pipefail
-state_file=/var/lib/pg-rw-proxy-installer/standby-bootstrap.state
-[[ -f "${state_file}" && ! -L "${state_file}" ]]
-[[ "$(stat -c '%U:%a' "${state_file}")" == 'root:600' ]]
-grep -Eq '^(original_pgdata|partial_pgdata|original_or_partial_pgdata)=/var/backups/pg-readwrite-proxy-lab/standby-' "${state_file}"
 [[ -f "${PGDATA}/PG_VERSION" && "$(tr -d '\r\n' <"${PGDATA}/PG_VERSION")" == 12 ]]
 for file in postgresql.conf postgresql.auto.conf pg_hba.conf standby.signal global/pg_control; do
   [[ -f "${PGDATA}/${file}" && ! -L "${PGDATA}/${file}" ]]
 done
-if grep -Fxq 'basebackup_complete=yes' "${state_file}"; then
-  evidence=state_marker
-elif grep -Fqx '# BEGIN PG_RW_PROXY_RECOVERY' "${PGDATA}/postgresql.auto.conf" && \
-     grep -Fqx '# END PG_RW_PROXY_RECOVERY' "${PGDATA}/postgresql.auto.conf" && \
-     grep -Fqx '# BEGIN PG_RW_PROXY_INCLUDE' "${PGDATA}/postgresql.conf" && \
-     grep -Fqx '# END PG_RW_PROXY_INCLUDE' "${PGDATA}/postgresql.conf" && \
-     grep -Fq "cluster_name = 'rw-standby'" "${PGDATA}/conf.d/99-pg-rw-proxy.conf"; then
-  evidence=legacy_post_basebackup_managed_config
-else
-  exit 3
-fi
+grep -Fqx '# BEGIN PG_RW_PROXY_RECOVERY' "${PGDATA}/postgresql.auto.conf"
+grep -Fqx '# END PG_RW_PROXY_RECOVERY' "${PGDATA}/postgresql.auto.conf"
+grep -Fqx '# BEGIN PG_RW_PROXY_INCLUDE' "${PGDATA}/postgresql.conf"
+grep -Fqx '# END PG_RW_PROXY_INCLUDE' "${PGDATA}/postgresql.conf"
+[[ -f "${PGDATA}/conf.d/99-pg-rw-proxy.conf" && ! -L "${PGDATA}/conf.d/99-pg-rw-proxy.conf" ]]
+grep -Fq "cluster_name = 'rw-standby'" "${PGDATA}/conf.d/99-pg-rw-proxy.conf"
+evidence=live_pgdata_managed_recovery
 running=no
 runuser -u postgres -- env PATH="${BIN_DIR}:/usr/bin:/bin" "${BIN_DIR}/pg_ctl" -D "${PGDATA}" status >/dev/null 2>&1 && running=yes
 control_system_id="$(runuser -u postgres -- env PATH="${BIN_DIR}:/usr/bin:/bin" "${BIN_DIR}/pg_controldata" "${PGDATA}" |
@@ -404,6 +513,50 @@ REMOTE
   } | remote_root "${host}"
 }
 
+primary_managed_role_snapshot() {
+  {
+    printf 'ADMIN_TOOL=%q\n' "${PRIMARY_ADMIN_TOOL}"
+    printf 'PORT=%q\n' "${PRIMARY_PORT}"
+    printf 'REPLICATION_USER=%q\n' "${REPLICATION_USER}"
+    printf 'MONITOR_USER=%q\n' "${MONITOR_USER}"
+    cat <<'REMOTE'
+set -Eeuo pipefail
+roles="$("${ADMIN_TOOL}" psql -d postgres -p "${PORT}" -c \
+  "select (select count(*) from pg_roles where rolname='${REPLICATION_USER}' and rolcanlogin and rolreplication),
+          (select count(*) from pg_roles where rolname='${MONITOR_USER}' and rolcanlogin and not rolreplication)")"
+[[ "${roles}" == '1|1' ]]
+printf 'MANAGED_ROLES=%s\n' "${roles}"
+REMOTE
+  } | remote_root "${PRIMARY_HOST}"
+}
+
+remote_credential_prerequisites() {
+  local host="$1" role="$2"
+  {
+    printf 'ROLE=%q\n' "${role}"
+    printf 'PG_OS_USER=%q\n' "${PG_OS_USER}"
+    if [[ "${role}" == primary ]]; then
+      printf 'PGDATA=%q\n' "${PRIMARY_PGDATA}"
+    else
+      printf 'PGDATA=%q\n' "${STANDBY_PGDATA}"
+    fi
+    cat <<'REMOTE'
+set -Eeuo pipefail
+for command_name in bash install rm chmod chown stat mktemp mv getent runuser sha256sum awk sed grep; do
+  command -v "${command_name}" >/dev/null 2>&1
+done
+[[ -d /var/tmp && ! -L /var/tmp && -w /var/tmp ]]
+[[ -f "${PGDATA}/PG_VERSION" && ! -L "${PGDATA}/PG_VERSION" ]]
+if [[ "${ROLE}" == standby ]]; then
+  postgres_home="$(getent passwd "${PG_OS_USER}" | cut -d: -f6)"
+  [[ "${postgres_home}" == /* && -d "${postgres_home}" && ! -L "${postgres_home}" && -w "${postgres_home}" ]]
+  [[ "$(stat -c '%U' "${postgres_home}")" == "${PG_OS_USER}" ]]
+fi
+printf 'CREDENTIAL_PREREQUISITES=%s|ready\n' "${ROLE}"
+REMOTE
+  } | remote_root "${host}"
+}
+
 primary_hba_policy_snapshot() {
   {
     printf 'ADMIN_TOOL=%q\n' "${PRIMARY_ADMIN_TOOL}"
@@ -463,6 +616,27 @@ REMOTE
   } | remote_root "${PRIMARY_HOST}"
 }
 
+managed_credential_target_snapshot() {
+  local primary_role_state standby_passfile_state
+  primary_role_state="$(primary_managed_role_snapshot)" || return 1
+  standby_passfile_state="$({
+    printf 'PG_OS_USER=%q\n' "${PG_OS_USER}"
+    cat <<'REMOTE'
+set -Eeuo pipefail
+postgres_home="$(getent passwd "${PG_OS_USER}" | cut -d: -f6)"
+[[ "${postgres_home}" == /* && -d "${postgres_home}" && ! -L "${postgres_home}" ]]
+passfile="${postgres_home}/.pgpass-rw-proxy"
+if [[ -e "${passfile}" || -L "${passfile}" ]]; then
+  [[ -f "${passfile}" && ! -L "${passfile}" ]]
+  stat -c 'STANDBY_PASSFILE=%U|%G|%a|%s|%Y' "${passfile}"
+else
+  printf 'STANDBY_PASSFILE=absent\n'
+fi
+REMOTE
+  } | remote_root "${STANDBY_HOST}")" || return 1
+  printf '%s;%s' "${primary_role_state}" "${standby_passfile_state}"
+}
+
 query_direct() {
   local host="$1" port="$2" user="$3" password="$4" database="$5" sql="$6"
   env LD_LIBRARY_PATH="${CHECK_LD_LIBRARY_PATH}" PGPASSWORD="${password}" PGCONNECT_TIMEOUT=5 \
@@ -480,6 +654,22 @@ check_active_install_or_sync
 INSTALL_PHASE='只读校验 Primary、Standby 与 Streaming Replication'
 primary_snapshot="$(remote_database_snapshot "${PRIMARY_HOST}" primary)" || \
   database_blocked primary_unreachable 'Primary 运行状态读取失败'
+managed_role_snapshot="$(primary_managed_role_snapshot)" || \
+  database_blocked managed_roles 'Primary 缺少安装器受管的复制/监控角色，repair.sh 不负责猜测创建新角色'
+[[ "${managed_role_snapshot}" == 'MANAGED_ROLES=1|1' ]] || \
+  database_blocked managed_roles "Primary 受管角色状态异常：${managed_role_snapshot:-empty}"
+printf 'CHECK managed_roles status=PASS replication=yes monitor=yes source=primary_live_state\n'
+primary_credential_prerequisites="$(remote_credential_prerequisites "${PRIMARY_HOST}" primary)" || \
+  database_blocked primary_credential_prerequisites 'Primary 不满足受管凭据轮换所需命令、目录或权限'
+standby_credential_prerequisites="$(remote_credential_prerequisites "${STANDBY_HOST}" standby)" || \
+  database_blocked standby_credential_prerequisites 'Standby 不满足复制密码文件更新所需命令、目录或权限'
+[[ "${primary_credential_prerequisites}" == 'CREDENTIAL_PREREQUISITES=primary|ready' && \
+   "${standby_credential_prerequisites}" == 'CREDENTIAL_PREREQUISITES=standby|ready' ]] || \
+  database_blocked credential_prerequisites '受管凭据前置条件返回值异常'
+printf 'CHECK managed_credential_prerequisites status=PASS primary=ready standby=ready persistent_write=no\n'
+managed_credential_baseline="$(managed_credential_target_snapshot)" || \
+  database_blocked credential_fingerprint '无法生成受管凭据目标的只读状态指纹'
+printf 'CHECK managed_credential_fingerprint status=PASS captured=yes persistent_write=no\n'
 standby_resume_needed=no
 standby_resume_evidence=''
 standby_resume_running=''
@@ -533,10 +723,6 @@ else
   printf 'CHECK streaming_replication status=PASS application=%s slot=%s\n' "${STANDBY_APPLICATION_NAME}" "${REPLICATION_SLOT_NAME}"
 fi
 
-monitor_primary="$(query_direct "${PRIMARY_HOST}" "${PRIMARY_PORT}" "${MONITOR_USER}" "${MONITOR_PASSWORD}" postgres 'select pg_is_in_recovery()')" || \
-  database_blocked monitor_auth 'Pgpool 监控账号无法连接 Primary'
-[[ "${monitor_primary}" == f ]] || database_blocked monitor_role "监控账号读取到的 Primary 角色异常：${monitor_primary}"
-
 probe_contract_sql="select case when exists (
   select 1 from pg_class c join pg_namespace n on n.oid=c.relnamespace
   where n.nspname='business' and c.relname='rw_probe' and c.relkind='r'
@@ -551,16 +737,13 @@ business_primary="$(query_direct "${PRIMARY_HOST}" "${PRIMARY_PORT}" "${BUSINESS
 [[ "${business_primary}" == "${BUSINESS_USER}|f|rw-primary|compatible" ]] || \
   database_blocked business_probe "Primary 业务账号或路由探针异常：${business_primary:-empty}"
 if [[ "${standby_resume_needed}" == no ]]; then
-  monitor_standby="$(query_direct "${STANDBY_HOST}" "${STANDBY_PORT}" "${MONITOR_USER}" "${MONITOR_PASSWORD}" postgres 'select pg_is_in_recovery()')" || \
-    database_blocked monitor_auth 'Pgpool 监控账号无法连接 Standby'
-  [[ "${monitor_standby}" == t ]] || database_blocked monitor_role "监控账号读取到的 Standby 角色异常：${monitor_standby}"
   business_standby="$(query_direct "${STANDBY_HOST}" "${STANDBY_PORT}" "${BUSINESS_USER}" "${REQUEST_BUSINESS_PASSWORD}" "${BUSINESS_DATABASE}" "select current_user,pg_is_in_recovery(),current_setting('cluster_name'),(${probe_contract_sql})")" || \
     database_blocked business_auth '业务账号无法连接 Standby'
   [[ "${business_standby}" == "${BUSINESS_USER}|t|rw-standby|compatible" ]] || \
     database_blocked business_probe "Standby 业务账号或路由探针异常：${business_standby:-empty}"
-  printf 'CHECK database_credentials status=PASS monitor=yes business=yes probe=compatible\n'
+  printf 'CHECK database_credentials status=PASS business=yes probe=compatible managed_credentials=deferred_until_REPAIR\n'
 else
-  printf 'CHECK database_credentials status=PARTIAL primary_monitor=yes primary_business=yes standby=deferred_until_resume\n'
+  printf 'CHECK database_credentials status=PARTIAL primary_business=yes standby=deferred_until_resume managed_credentials=deferred_until_REPAIR\n'
 fi
 
 INSTALL_PHASE='从 Primary 只读提取客户端 IPv4 白名单'
@@ -606,6 +789,8 @@ add_repair_item() {
   repair_items+=("${item}")
 }
 [[ "${standby_resume_needed}" == yes ]] && add_repair_item standby_resume_existing_pgdata
+add_repair_item rotate_installer_managed_credentials
+add_repair_item rebuild_session_configuration
 
 block_unsafe_pgpool() {
   printf 'REPAIR_RESULT=BLOCKED_PGPOOL_OWNERSHIP action=none reason=%s\n' "$1"
@@ -719,23 +904,12 @@ verify_local_pgpool_routing() {
   fi
 }
 
-if ((${#repair_items[@]} == 0)); then
-  if ! verify_local_pgpool_routing; then
-    add_repair_item pgpool_routing
-  else
-      printf 'REPAIR_DECISION=NONE\n'
-      printf 'REPAIR_RESULT=HEALTHY action=none entry=%s:%s log=%s\n' "${PGPOOL_HOST}" "${PGPOOL_PORT}" "${REPAIR_LOG_FILE}"
-      trap - ERR
-      exit 0
-  fi
-fi
-
 printf '\n检测到以下可安全续装项：\n'
 printf '  - %s\n' "${repair_items[@]}"
 if [[ "${standby_resume_needed}" == yes ]]; then
-  printf '基础备份完整性证据已通过；修复会先启动/等待现有 Standby PGDATA，然后补齐 Pgpool。不会执行 pg_basebackup，也不会重建主从。\n'
+  printf '基础备份完整性证据已通过；修复会轮换安装器管理的复制/监控凭据、续启现有 Standby PGDATA并补齐 Pgpool。不会执行 pg_basebackup，也不会重建主从。\n'
 else
-  printf '数据库状态已通过；修复范围只包括当前 Pgpool 服务器的离线运行时、配置和 systemd 服务。\n'
+  printf '数据库状态已通过；修复会轮换安装器管理的复制/监控凭据、更新 Standby 私有复制密码文件并补齐 Pgpool。不会停止或重启数据库。\n'
 fi
 INSTALL_PHASE='等待中断续装授权'
 if ! read -r -p '输入 REPAIR 执行上述安全续装；其他输入只保留日志并退出: ' confirmation; then
@@ -756,11 +930,39 @@ latest_primary_hba_sha256="$(primary_hba_source_sha256)" || \
   die "Primary HBA 在检查与落盘之间发生变化：before=${PRIMARY_POLICY_SOURCE_SHA256} after=${latest_primary_hba_sha256}；请重新运行 repair.sh。" 25
 [[ "$(sha256sum "${primary_policy_rules_file}" | awk '{print $1}')" == "${PRIMARY_POLICY_SHA256}" ]] || \
   die '本次 Pgpool 客户端策略文件在授权前发生变化，拒绝落盘。' 25
+latest_managed_credential_target="$(managed_credential_target_snapshot)" || \
+  die '修复授权后无法重新生成受管凭据目标状态指纹。' 25
+[[ "${latest_managed_credential_target}" == "${managed_credential_baseline}" ]] || \
+  die '受管角色或 Standby 复制密码文件在只读检查与 REPAIR 之间发生变化；请重新运行 repair.sh。' 25
 if [[ "${service_active}" == yes ]]; then
   established_frontends="$(ss -Htn state established "sport = :${PGPOOL_PORT}" 2>/dev/null | awk 'END{print NR+0}')"
   [[ "${established_frontends}" == '0' ]] || \
     die "Pgpool 当前仍有 ${established_frontends} 个外部 TCP 前端连接；请先停止客户端连接池后重试。" 23
 fi
+
+INSTALL_PHASE='轮换安装器受管凭据'
+log '使用本次临时配置轮换复制/监控账号密码；不修改业务账号，不停止数据库，不中断当前复制连接。'
+run_staged_managed_credential_script "${PRIMARY_HOST}" primary
+run_staged_managed_credential_script "${STANDBY_HOST}" standby
+
+INSTALL_PHASE='验证本次监控凭据已生效'
+monitor_primary=''
+for ((elapsed=0; elapsed<60; elapsed+=2)); do
+  monitor_primary="$(query_direct "${PRIMARY_HOST}" "${PRIMARY_PORT}" "${MONITOR_USER}" "${MONITOR_PASSWORD}" postgres 'select pg_is_in_recovery()' 2>/dev/null || true)"
+  [[ "${monitor_primary}" == f ]] && break
+  sleep 2
+done
+[[ "${monitor_primary}" == f ]] || die '本次监控凭据在 Primary 上未生效。' 21
+if [[ "${standby_resume_needed}" == no ]]; then
+  monitor_standby=''
+  for ((elapsed=0; elapsed<60; elapsed+=2)); do
+    monitor_standby="$(query_direct "${STANDBY_HOST}" "${STANDBY_PORT}" "${MONITOR_USER}" "${MONITOR_PASSWORD}" postgres 'select pg_is_in_recovery()' 2>/dev/null || true)"
+    [[ "${monitor_standby}" == t ]] && break
+    sleep 2
+  done
+  [[ "${monitor_standby}" == t ]] || die '本次监控凭据未及时复制到 Standby 或认证失败。' 21
+fi
+printf 'CHECK managed_credentials status=PASS source=current_command database_restart=no basebackup=not_run\n'
 
 if [[ "${standby_resume_needed}" == yes ]]; then
   INSTALL_PHASE='续启已完成基础备份的 Standby'
@@ -776,6 +978,7 @@ if [[ "${standby_resume_needed}" == yes ]]; then
   standby_resume_status=$?
   set -e
   cleanup_standby_resume_stage "${standby_resume_stage}"
+  standby_resume_stage=''
   printf '%s\n' "${standby_resume_output}"
   [[ "${standby_resume_status}" == 0 && "${standby_resume_output}" == *'STANDBY_RESUME_RESULT=READY'* && \
      "${standby_resume_output}" == *'basebackup=not_run'* ]] || \
@@ -802,9 +1005,9 @@ INSTALL_PHASE='修复 Pgpool 配置、认证与服务状态'
 INSTALL_PHASE='修复后完整路由与外部入口验收'
 verify_local_pgpool_routing || die '续装修复完成后本机路由验收仍失败；请保留完整日志。' 24
 
-repair_action='pgpool_only'
-[[ "${standby_resume_needed}" == yes ]] && repair_action='resume_existing_standby_then_pgpool'
-printf 'REPAIR_RESULT=REPAIRED action=%s basebackup=not_run entry=%s:%s log=%s\n' \
+repair_action='rotate_managed_credentials_then_pgpool'
+[[ "${standby_resume_needed}" == yes ]] && repair_action='rotate_managed_credentials_resume_existing_standby_then_pgpool'
+printf 'REPAIR_RESULT=REPAIRED action=%s config_source=current_command_only prior_install_files=ignored basebackup=not_run database_restart=no entry=%s:%s log=%s\n' \
   "${repair_action}" "${PGPOOL_HOST}" "${PGPOOL_PORT}" "${REPAIR_LOG_FILE}"
 trap - ERR
 exit 0
